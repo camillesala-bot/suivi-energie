@@ -188,7 +188,7 @@ def get_all_weeks_of_year(year: int):
 
 def get_secteurs_list():
     with engine.connect() as conn:
-        df = pd.read_sql("SELECT nom FROM secteurs ORDER BY id", conn)
+        df = pd.read_sql(text("SELECT nom FROM secteurs ORDER BY id"), conn)
     return df['nom'].tolist() if not df.empty else DEFAULT_SECTEURS
 
 def convertir_en_mwh_equivalent(valeur: float, unite: str) -> float:
@@ -256,14 +256,14 @@ if menu == "📊 Dashboard Global":
     display_flash()
     
     with engine.connect() as conn:
-        df_releves = pd.read_sql("""
+        df_releves = pd.read_sql(text("""
             SELECT r.*, c.numero_compteur, c.type_energie, c.unite, 
                    s.nom as site_nom, s.secteur, s.surface_m2, s.epoque, s.ordre
             FROM releves r 
             JOIN compteurs c ON r.compteur_id = c.id
             JOIN sites s ON c.site_id = s.id
             ORDER BY r.date_releve DESC
-        """, conn)
+        """), conn)
 
     if df_releves.empty:
         st.info("👋 Aucun relevé enregistré. Rendez-vous dans l'onglet **Gestion Sites, Compteurs & Secteurs** pour ajouter vos bâtiments.")
@@ -318,7 +318,7 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
     display_flash()
     
     with engine.connect() as conn:
-        df_sites = pd.read_sql("SELECT * FROM sites ORDER BY ordre ASC, nom ASC", conn)
+        df_sites = pd.read_sql(text("SELECT * FROM sites ORDER BY ordre ASC, nom ASC"), conn)
 
     if df_sites.empty:
         st.info("Aucun site enregistré.")
@@ -330,13 +330,13 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
         site_info = df_sites[df_sites['id'] == site_id].iloc[0]
 
         with engine.connect() as conn:
-            df_compteurs = pd.read_sql("SELECT * FROM compteurs WHERE site_id = %(s_id)s", conn, params={"s_id": site_id})
-            df_releves = pd.read_sql("""
+            df_compteurs = pd.read_sql(text("SELECT * FROM compteurs WHERE site_id = :s_id"), conn, params={"s_id": site_id})
+            df_releves = pd.read_sql(text("""
                 SELECT r.semaine_label, r.date_releve, r.conso_val, r.dju_reels, c.numero_compteur, c.type_energie, c.unite 
                 FROM releves r JOIN compteurs c ON r.compteur_id = c.id 
-                WHERE c.site_id = %(s_id)s
+                WHERE c.site_id = :s_id
                 ORDER BY r.date_releve ASC
-            """, conn, params={"s_id": site_id})
+            """), conn, params={"s_id": site_id})
 
         st.write(f"### 🏢 {site_info['nom']} — Surface : {site_info['surface_m2']} m² ({site_info['epoque']})")
         
@@ -378,12 +378,12 @@ elif menu == "📝 Saisie Hebdomadaire":
     display_flash()
     
     with engine.connect() as conn:
-        df_compteurs = pd.read_sql("""
-            SELECT c.id as compteur_id, s.nom as Bâtiment, s.secteur as Secteur, s.ordre as Ordre,
-                   c.numero_compteur as 'N° Compteur', c.type_energie as Énergie, c.unite as Unité
+        df_compteurs = pd.read_sql(text("""
+            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ordre as "Ordre",
+                   c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
             FROM compteurs c JOIN sites s ON c.site_id = s.id
             ORDER BY s.ordre ASC, s.nom ASC, c.numero_compteur ASC
-        """, conn)
+        """), conn)
 
     if df_compteurs.empty:
         st.warning("Aucun compteur enregistré dans la base.")
@@ -415,19 +415,19 @@ elif menu == "📝 Saisie Hebdomadaire":
             dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_auto))
 
             with engine.connect() as conn:
-                df_prev = pd.read_sql("""
+                df_prev = pd.read_sql(text("""
                     SELECT r.compteur_id, r.conso_val 
                     FROM releves r
-                    WHERE r.date_releve < %(d_start)s 
+                    WHERE r.date_releve < :d_start 
                     AND r.id IN (
-                        SELECT MAX(id) FROM releves WHERE date_releve < %(d_start)s GROUP BY compteur_id
+                        SELECT MAX(id) FROM releves WHERE date_releve < :d_start GROUP BY compteur_id
                     )
-                """, conn, params={"d_start": date_d.strftime("%Y-%m-%d")})
+                """), conn, params={"d_start": date_d.strftime("%Y-%m-%d")})
                 
                 dict_prev = dict(zip(df_prev['compteur_id'], df_prev['conso_val'])) if not df_prev.empty else {}
 
                 df_existants = pd.read_sql(
-                    "SELECT compteur_id, conso_val FROM releves WHERE semaine_label = %(sem)s",
+                    text("SELECT compteur_id, conso_val FROM releves WHERE semaine_label = :sem"),
                     conn, params={"sem": semaine_label}
                 )
 
@@ -546,7 +546,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     with tab_edit_site:
         st.subheader("✏️ Modifier les caractéristiques, renommer ou supprimer un site")
         with engine.connect() as conn:
-            sites_db = pd.read_sql("SELECT id, nom, secteur, surface_m2, epoque, ordre FROM sites ORDER BY ordre ASC, nom ASC", conn).to_dict('records')
+            sites_db = pd.read_sql(text("SELECT id, nom, secteur, surface_m2, epoque, ordre FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
 
         if not sites_db:
             st.info("Aucun bâtiment à modifier.")
@@ -556,7 +556,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
             site_id_selected = site_dict_edit[choix_site_edit]
 
             with engine.connect() as conn:
-                site_actuel = pd.read_sql("SELECT * FROM sites WHERE id = %(sid)s", conn, params={"sid": site_id_selected}).iloc[0]
+                site_actuel = pd.read_sql(text("SELECT * FROM sites WHERE id = :sid"), conn, params={"sid": site_id_selected}).iloc[0]
 
             if site_actuel is not None:
                 with st.form(key=f"form_edit_site_{site_id_selected}"):
@@ -564,7 +564,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     nouveau_secteur = st.selectbox("Secteur", LISTE_SECTEURS, index=LISTE_SECTEURS.index(site_actuel['secteur']) if site_actuel['secteur'] in LISTE_SECTEURS else 0)
                     nouvelle_surface = st.number_input("Surface chauffée (m²)", min_value=10.0, value=float(site_actuel['surface_m2']))
                     nouvelle_epoque = st.selectbox("Époque / RT", list(REFERENTIEL_EPOQUES.keys()), index=list(REFERENTIEL_EPOQUES.keys()).index(site_actuel['epoque']) if site_actuel['epoque'] in REFERENTIEL_EPOQUES else 0)
-                    nouvel_ordre = st.number_input("Ordre d'affichage (Numéro)", min_value=0, value=int(site_actuel['ordre'] if site_actuel['ordre'] else 0))
+                    nouvel_ordre = st.number_input("Ordre d'affichage (Numéro)", min_value=0, value=int(site_actuel['ordre'] if pd.notna(site_actuel['ordre']) else 0))
                     
                     submitted_save_site = st.form_submit_button("💾 Enregistrer les modifications", type="primary")
                     
@@ -591,7 +591,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     with tab_ordre_sites:
         st.subheader("🔢 Organiser l'ordre des Bâtiments")
         with engine.connect() as conn:
-            df_ordre_sites = pd.read_sql("SELECT id, nom as \"Bâtiment\", secteur as \"Secteur\", ordre as \"Ordre\" FROM sites ORDER BY ordre ASC, nom ASC", conn)
+            df_ordre_sites = pd.read_sql(text("""SELECT id, nom as "Bâtiment", secteur as "Secteur", ordre as "Ordre" FROM sites ORDER BY ordre ASC, nom ASC"""), conn)
 
         if df_ordre_sites.empty:
             st.info("Aucun bâtiment dans la base.")
@@ -617,7 +617,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     with tab_add_compteur:
         st.subheader("➕ Rattacher un sous-compteur à un bâtiment")
         with engine.connect() as conn:
-            sites_for_compteurs = pd.read_sql("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC", conn).to_dict('records')
+            sites_for_compteurs = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
 
         if not sites_for_compteurs:
             st.info("Aucun bâtiment disponible. Créez d'abord un bâtiment.")
@@ -654,12 +654,12 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     with tab_edit_compteur:
         st.subheader("✏️ Modifier, Réattribuer ou Supprimer un Sous-Compteur")
         with engine.connect() as conn:
-            compteurs_db = pd.read_sql("""
+            compteurs_db = pd.read_sql(text("""
                 SELECT c.id, c.site_id, c.numero_compteur, c.type_energie, c.unite, s.nom as site_nom, s.secteur 
                 FROM compteurs c JOIN sites s ON c.site_id = s.id 
                 ORDER BY s.ordre ASC, s.nom ASC, c.numero_compteur ASC
-            """, conn).to_dict('records')
-            all_sites_db = pd.read_sql("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC", conn).to_dict('records')
+            """), conn).to_dict('records')
+            all_sites_db = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
 
         if not compteurs_db:
             st.info("Aucun sous-compteur enregistré.")
@@ -669,7 +669,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
             compteur_id_selected = compteur_dict_edit[choix_c_edit]
 
             with engine.connect() as conn:
-                c_actuel = pd.read_sql("SELECT * FROM compteurs WHERE id = %(cid)s", conn, params={"cid": compteur_id_selected}).iloc[0]
+                c_actuel = pd.read_sql(text("SELECT * FROM compteurs WHERE id = :cid"), conn, params={"cid": compteur_id_selected}).iloc[0]
 
             if c_actuel is not None:
                 site_options = {f"{s['nom']} ({s['secteur']})": int(s['id']) for s in all_sites_db}
@@ -711,7 +711,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     with tab_secteurs:
         st.subheader("🏷️ Personnaliser et renommer les 7 secteurs")
         with engine.connect() as conn:
-            secteurs_rows = pd.read_sql("SELECT id, nom FROM secteurs ORDER BY id", conn).to_dict('records')
+            secteurs_rows = pd.read_sql(text("SELECT id, nom FROM secteurs ORDER BY id"), conn).to_dict('records')
 
         with st.form("form_renommer_secteurs"):
             nouveaux_noms_map = {}
@@ -738,12 +738,12 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
 
     with tab_list:
         with engine.connect() as conn:
-            df_all = pd.read_sql("""
-                SELECT s.ordre as Ordre, s.nom as Bâtiment, s.secteur as Secteur, s.surface_m2 as Surface, s.epoque as 'Époque RT',
-                       c.numero_compteur as 'N° Compteur', c.type_energie as Énergie, c.unite as Unité
+            df_all = pd.read_sql(text("""
+                SELECT s.ordre as "Ordre", s.nom as "Bâtiment", s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
+                       c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
                 FROM sites s LEFT JOIN compteurs c ON s.id = c.site_id
                 ORDER BY s.ordre ASC, s.nom ASC
-            """, conn)
+            """), conn)
         
         col_l1, col_l2 = st.columns([3, 1])
         col_l1.subheader("📋 Répertoire complet du parc")
