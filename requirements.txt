@@ -4,3 +4,4 @@ requests
 openpyxl
 sqlalchemy
 psycopg2-binary
+pg8000
