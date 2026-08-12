@@ -4,6 +4,7 @@ import requests
 import contextlib
 import io
 import os
+import time
 from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine, text
 
@@ -206,8 +207,13 @@ def convertir_en_mwh_equivalent(valeur: float, unite: str) -> float:
         return float(valeur) / 1000.0
     return float(valeur)
 
-@st.cache_data(ttl=3600)
-def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73) -> float:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_dju_hebdo_raw(date_debut_str: str, date_fin_str: str, lat: float, lon: float) -> dict:
+    """
+    Interroge Open-Meteo avec plusieurs tentatives.
+    Ne renvoie JAMAIS de valeur de secours silencieuse : lève une exception en cas d'échec,
+    ce qui empêche Streamlit de mettre en cache un résultat invalide.
+    """
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat, "longitude": lon,
@@ -215,22 +221,73 @@ def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73)
         "daily": ["temperature_2m_max", "temperature_2m_min"],
         "timezone": "Europe/Paris"
     }
+
+    last_error = None
+    data = None
+    for attempt in range(3):
+        try:
+            res = requests.get(url, params=params, timeout=8)
+            res.raise_for_status()
+            data = res.json()
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+
+    if data is None:
+        raise RuntimeError(f"Échec après 3 tentatives : {last_error}")
+
+    if "daily" not in data or "temperature_2m_max" not in data["daily"]:
+        raise RuntimeError("Réponse Open-Meteo inattendue (structure de données manquante).")
+
+    temps_max = data["daily"]["temperature_2m_max"]
+    temps_min = data["daily"]["temperature_2m_min"]
+    jours_total = len(temps_max)
+
+    dju_total = 0.0
+    jours_valides = 0
+    for t_max, t_min in zip(temps_max, temps_min):
+        if t_max is not None and t_min is not None:
+            dju_total += max(0.0, 18.0 - (t_min + t_max) / 2)
+            jours_valides += 1
+
+    if jours_valides == 0:
+        raise RuntimeError("Aucune donnée météo disponible pour cette période (trop récente ?).")
+
+    return {"dju": round(dju_total, 1), "jours_valides": jours_valides, "jours_total": jours_total}
+
+
+def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73) -> dict:
+    """
+    Retourne {"dju": float, "fiable": bool, "message": str|None}.
+    Le message explique pourquoi la valeur n'est pas fiable, le cas échéant.
+    """
     try:
-        res = requests.get(url, params=params, timeout=5)
-        res.raise_for_status()
-        data = res.json()
-        dju_total = 0.0
-        if "daily" in data and "temperature_2m_max" in data["daily"]:
-            for i in range(len(data["daily"]["time"])):
-                t_max = data["daily"]["temperature_2m_max"][i]
-                t_min = data["daily"]["temperature_2m_min"][i]
-                if t_max is not None and t_min is not None:
-                    t_moy = (t_min + t_max) / 2
-                    dju_total += max(0.0, 18.0 - t_moy)
-            return round(dju_total, 1)
-        return 100.0
-    except Exception:
-        return 100.0
+        result = _fetch_dju_hebdo_raw(date_debut_str, date_fin_str, lat, lon)
+    except Exception as e:
+        return {
+            "dju": 100.0,
+            "fiable": False,
+            "message": f"⚠️ Impossible de récupérer la météo réelle ({e}). Valeur par défaut (100.0) utilisée — à corriger manuellement si besoin."
+        }
+
+    if result["jours_valides"] < result["jours_total"]:
+        manquants = result["jours_total"] - result["jours_valides"]
+        return {
+            "dju": result["dju"],
+            "fiable": False,
+            "message": f"⚠️ Données météo incomplètes ({manquants} jour(s) sur {result['jours_total']} pas encore disponibles — délai habituel de l'API). Le DJU est probablement sous-évalué."
+        }
+
+    if not (0 <= result["dju"] <= 250):
+        return {
+            "dju": result["dju"],
+            "fiable": False,
+            "message": f"⚠️ Valeur DJU inhabituelle ({result['dju']}) — à vérifier manuellement."
+        }
+
+    return {"dju": result["dju"], "fiable": True, "message": None}
 
 # --- NAVIGATION ---
 with st.sidebar:
@@ -414,8 +471,10 @@ elif menu == "📝 Saisie Hebdomadaire":
             date_f = selected_week_data["sun"]
             semaine_label = selected_week_data["label"]
 
-            dju_auto = fetch_dju_hebdo(date_d.strftime("%Y-%m-%d"), date_f.strftime("%Y-%m-%d"))
-            dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_auto))
+            dju_result = fetch_dju_hebdo(date_d.strftime("%Y-%m-%d"), date_f.strftime("%Y-%m-%d"))
+            dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
+            if dju_result["message"]:
+                st.warning(dju_result["message"])
 
             with engine.connect() as conn:
                 df_prev = pd.read_sql(text("""
