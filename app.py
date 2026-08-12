@@ -69,7 +69,7 @@ def check_password():
     return True
 
 if not check_password():
-    st.stop())
+    st.stop()
 
 # --- NOTIFICATIONS ---
 if "flash_msg" not in st.session_state:
