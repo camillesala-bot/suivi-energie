@@ -41,8 +41,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- AUTHENTIFICATION ---
-MOT_DE_PASSE_PAR_DEFAUT = "Mairie2026"
-
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
@@ -51,12 +49,17 @@ def check_password():
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown('<div class="main-header" style="text-align: center;"><h2>🔒 Accès Sécurisé</h2><span>Suivi Énergétique du Parc Municipal</span></div>', unsafe_allow_html=True)
+
+            expected_pwd = st.secrets.get("APP_PASSWORD")
+            if not expected_pwd:
+                st.error("⚠️ Aucun mot de passe (APP_PASSWORD) n'est configuré dans les secrets de l'application. Accès bloqué tant que ce n'est pas corrigé.")
+                st.stop()
+
             with st.form("form_login"):
                 pwd_input = st.text_input("Veuillez saisir le mot de passe :", type="password")
                 submit_login = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
-                
+
                 if submit_login:
-                    expected_pwd = st.secrets.get("APP_PASSWORD", MOT_DE_PASSE_PAR_DEFAUT)
                     if pwd_input == expected_pwd:
                         st.session_state["authenticated"] = True
                         st.rerun()
@@ -66,7 +69,7 @@ def check_password():
     return True
 
 if not check_password():
-    st.stop()
+    st.stop())
 
 # --- NOTIFICATIONS ---
 if "flash_msg" not in st.session_state:
