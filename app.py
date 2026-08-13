@@ -5,6 +5,8 @@ import contextlib
 import io
 import os
 import time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine, text
 
@@ -109,6 +111,11 @@ REFERENTIEL_EPOQUES = {
 # Sert à pondérer la cible hebdomadaire selon la rigueur climatique réelle de la semaine.
 DJU_ANNUEL_REFERENCE = 2200
 
+# Délai (en jours) avant de considérer que l'API météo a normalement complété ses données
+# pour une semaine donnée. Passé ce délai, une semaine dont le DJU avait été marqué "non fiable"
+# (données incomplètes au moment de la saisie) est automatiquement redemandée et corrigée.
+DELAI_DJU_JOURS = 5
+
 # Unités valides par type d'énergie (évite les erreurs de conversion, ex: kW confondu avec kWh,
 # ou m3 utilisé pour un compteur électrique/chauffage urbain sans équivalence énergétique fiable)
 UNITES_PAR_ENERGIE = {
@@ -130,7 +137,18 @@ def get_db_engine():
         db_url = st.secrets["db"]["url"]
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return create_engine(db_url, pool_pre_ping=True)
+        # Pool dimensionné pour ~20 agents se connectant au même créneau (relevés du lundi matin) :
+        # pool_size=20 (connexions maintenues ouvertes) + max_overflow=10 (marge en pic) = 30 max,
+        # très en dessous de la limite du pooler Supabase (plan gratuit : 200 connexions).
+        # pool_recycle évite de garder des connexions "mortes" ouvertes trop longtemps entre deux lundis.
+        return create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_size=20,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=1800,
+        )
     else:
         # Repli local SQLite si pas de configuration Supabase
         return create_engine("sqlite:///parc_energie_multicompteurs.db")
@@ -193,6 +211,16 @@ def init_db():
         
         try:
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_releves_compteur_semaine ON releves(compteur_id, semaine_label);"))
+        except Exception:
+            pass
+
+        # Colonnes ajoutées après la création initiale des tables : ignore l'erreur si elles existent déjà
+        try:
+            conn.execute(text(f"ALTER TABLE releves ADD COLUMN dju_fiable {'BOOLEAN DEFAULT TRUE' if is_postgres else 'BOOLEAN DEFAULT 1'}"))
+        except Exception:
+            pass
+        try:
+            conn.execute(text("ALTER TABLE releves_audit ADD COLUMN champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
         except Exception:
             pass
 
@@ -318,6 +346,54 @@ def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73)
 
     return {"dju": result["dju"], "fiable": True, "message": None}
 
+
+@st.cache_data(ttl=21600, show_spinner=False)  # 6h : évite de relancer la vérification à chaque page vue
+def refresh_stale_dju():
+    """
+    Recherche les semaines dont le DJU avait été enregistré comme "non fiable" (données météo
+    incomplètes au moment de la saisie), et le redemande à l'API dès que DELAI_DJU_JOURS est
+    écoulé — l'API a alors normalement fini de compléter ses données pour cette période.
+    Ne touche jamais à une valeur corrigée manuellement par un agent (voir dju_fiable_val
+    dans l'onglet Saisie : une modification manuelle marque la ligne comme déjà fiable).
+    Retourne le nombre de semaines corrigées.
+    """
+    limite = (date.today() - timedelta(days=DELAI_DJU_JOURS)).strftime("%Y-%m-%d")
+    with engine.connect() as conn:
+        semaines_a_verifier = pd.read_sql(text("""
+            SELECT semaine_label, MIN(date_releve) as date_fin
+            FROM releves
+            WHERE dju_fiable = FALSE AND date_releve <= :limite
+            GROUP BY semaine_label
+        """), conn, params={"limite": limite})
+
+    nb_semaines_corrigees = 0
+    for _, row in semaines_a_verifier.iterrows():
+        date_fin = pd.to_datetime(row['date_fin']).date()
+        date_debut = date_fin - timedelta(days=6)
+        resultat = fetch_dju_hebdo(date_debut.strftime("%Y-%m-%d"), date_fin.strftime("%Y-%m-%d"))
+
+        if resultat["fiable"]:
+            with engine.begin() as conn:
+                rows_affectees = conn.execute(text("""
+                    SELECT id, compteur_id, dju_reels FROM releves
+                    WHERE semaine_label = :sem AND dju_fiable = FALSE
+                """), {"sem": row['semaine_label']}).fetchall()
+
+                for r in rows_affectees:
+                    if abs(float(r[2]) - resultat["dju"]) > 1e-9:
+                        conn.execute(text("""
+                            INSERT INTO releves_audit (releve_id, compteur_id, semaine_label, ancienne_valeur, nouvelle_valeur, date_modification, champ_modifie)
+                            VALUES (:rid, :cid, :sem, :old, :new, :dt, 'dju')
+                        """), {"rid": r[0], "cid": r[1], "sem": row['semaine_label'], "old": float(r[2]), "new": resultat["dju"], "dt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+
+                conn.execute(text("""
+                    UPDATE releves SET dju_reels = :dju, dju_fiable = TRUE
+                    WHERE semaine_label = :sem AND dju_fiable = FALSE
+                """), {"dju": resultat["dju"], "sem": row['semaine_label']})
+            nb_semaines_corrigees += 1
+
+    return nb_semaines_corrigees
+
 # --- NAVIGATION ---
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/lightning-bolt.png", width=64)
@@ -336,6 +412,15 @@ with st.sidebar:
     )
 
 LISTE_SECTEURS = get_secteurs_list()
+
+# Vérifie automatiquement, à chaque ouverture de l'app, si des semaines dont le DJU était
+# marqué "non fiable" peuvent maintenant être corrigées avec la donnée météo définitive.
+try:
+    nb_dju_corriges = refresh_stale_dju()
+    if nb_dju_corriges > 0:
+        set_flash(f"🌡️ Le DJU de {nb_dju_corriges} semaine(s) a été corrigé automatiquement avec la donnée météo définitive (voir l'historique des modifications).", "info")
+except Exception:
+    pass  # une panne de l'API météo ici ne doit jamais bloquer l'ouverture de l'app
 
 # ==============================================================================
 # TAB 1: DASHBOARD GLOBAL
@@ -458,13 +543,76 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
                 df_courbes = pivot_compteurs.copy()
                 df_courbes['Consommation Globale (MWh eq)'] = global_conso
 
+                # DJU agrégé par semaine avec une moyenne (et non drop_duplicates) : si plusieurs
+                # compteurs d'un même bâtiment ont été saisis avec un DJU légèrement différent pour
+                # la même semaine (ex: correction a posteriori d'un seul compteur), drop_duplicates()
+                # laisserait deux lignes pour la même semaine_label, ce qui ferait planter le reindex
+                # plus bas ("cannot reindex on an axis with duplicate labels").
+                df_dju = df_releves.groupby('semaine_label')['dju_reels'].mean().to_frame()
+
                 st.subheader("📉 Options d'affichage des courbes")
-                st.caption("ℹ️ Toutes les courbes sont exprimées en MWh équivalent, quelle que soit l'unité de relevé d'origine (m³, kWh...), pour rester comparables entre elles.")
+                st.caption("Les consommations sont exprimées sur l'axe de gauche (MWh eq) et la rigueur météo sur l'axe de droite (DJU réels).")
+
+                col_opt1, col_opt2 = st.columns([3, 1])
+
                 toutes_courbes = list(df_courbes.columns)
-                courbes_selectionnees = st.multiselect("Choisissez les courbes à faire apparaître sur le graphique :", options=toutes_courbes, default=toutes_courbes)
+                courbes_selectionnees = col_opt1.multiselect(
+                    "Choisissez les courbes de consommation à afficher :",
+                    options=toutes_courbes,
+                    default=toutes_courbes
+                )
+
+                afficher_dju = col_opt2.checkbox("Afficher les DJU réels", value=True)
 
                 if courbes_selectionnees:
-                    st.line_chart(df_courbes[courbes_selectionnees])
+                    # 1. Création de la figure Plotly autorisant deux axes Y
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                    # 2. Ajout des courbes de consommation (Axe Y1 - Gauche)
+                    for col in courbes_selectionnees:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=df_courbes.index,
+                                y=df_courbes[col],
+                                name=col,
+                                mode='lines+markers',
+                                hovertemplate="%{y:.2f} MWh<extra></extra>"
+                            ),
+                            secondary_y=False
+                        )
+
+                    # 3. Ajout de la courbe des DJU météo (Axe Y2 - Droit)
+                    if afficher_dju:
+                        dju_alignes = df_dju.reindex(df_courbes.index)['dju_reels']
+                        fig.add_trace(
+                            go.Scatter(
+                                x=df_courbes.index,
+                                y=dju_alignes,
+                                name="DJU Réels (Météo)",
+                                mode='lines',
+                                line=dict(color='#f59e0b', width=2.5, dash='dash'),  # Ligne orange en pointillés
+                                hovertemplate="%{y:.1f} DJU<extra></extra>"
+                            ),
+                            secondary_y=True
+                        )
+
+                    # 4. Mise en forme et habillage graphique
+                    fig.update_layout(
+                        title_text=f"Analyse croisée Consommation / DJU — {site_info['nom']}",
+                        hovermode="x unified",  # Info-bulle consolidée au survol
+                        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
+                        margin=dict(l=20, r=20, t=60, b=20),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(248,250,252,1)"
+                    )
+
+                    # Configuration des titres et grilles d'axes
+                    fig.update_yaxes(title_text="<b>Consommation</b> (MWh eq)", secondary_y=False, showgrid=True, gridcolor='#e2e8f0')
+                    fig.update_yaxes(title_text="<b>Rigueur Météo</b> (DJU réels)", secondary_y=True, showgrid=False)
+                    fig.update_xaxes(title_text="Semaine de relevé", tickangle=-45)
+
+                    # Rendu dans l'interface Streamlit
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.warning("Veuillez sélectionner au moins une courbe à afficher.")
 
@@ -516,6 +664,10 @@ elif menu == "📝 Saisie Hebdomadaire":
             dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
             if dju_result["message"]:
                 st.warning(dju_result["message"])
+            # Si l'agent a modifié manuellement la valeur proposée, on considère que c'est
+            # une correction délibérée : elle ne doit jamais être écrasée plus tard par la
+            # vérification automatique (refresh_stale_dju), même si l'API la jugeait "non fiable".
+            dju_fiable_val = True if abs(dju_val - dju_result["dju"]) > 1e-9 else dju_result["fiable"]
 
             with engine.connect() as conn:
                 # Le relevé précédent est déterminé par la date de relevé la plus récente avant
@@ -596,19 +748,19 @@ elif menu == "📝 Saisie Hebdomadaire":
                                     ancienne_valeur = float(existing[1])
                                     if abs(ancienne_valeur - val) > 1e-9:
                                         conn.execute(text("""
-                                            INSERT INTO releves_audit (releve_id, compteur_id, semaine_label, ancienne_valeur, nouvelle_valeur, date_modification)
-                                            VALUES (:rid, :cid, :sem, :old, :new, :dt)
+                                            INSERT INTO releves_audit (releve_id, compteur_id, semaine_label, ancienne_valeur, nouvelle_valeur, date_modification, champ_modifie)
+                                            VALUES (:rid, :cid, :sem, :old, :new, :dt, 'consommation')
                                         """), {"rid": existing[0], "cid": c_id, "sem": semaine_label, "old": ancienne_valeur, "new": val, "dt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
                                     conn.execute(text("""
                                         UPDATE releves 
-                                        SET date_releve = :d_str, conso_val = :val, dju_reels = :dju
+                                        SET date_releve = :d_str, conso_val = :val, dju_reels = :dju, dju_fiable = :dju_fiable
                                         WHERE id = :rid
-                                    """), {"d_str": d_str, "val": val, "dju": dju_val, "rid": existing[0]})
+                                    """), {"d_str": d_str, "val": val, "dju": dju_val, "dju_fiable": dju_fiable_val, "rid": existing[0]})
                                 else:
                                     conn.execute(text("""
-                                        INSERT INTO releves (compteur_id, semaine_label, date_releve, conso_val, dju_reels)
-                                        VALUES (:cid, :sem, :d_str, :val, :dju)
-                                    """), {"cid": c_id, "sem": semaine_label, "d_str": d_str, "val": val, "dju": dju_val})
+                                        INSERT INTO releves (compteur_id, semaine_label, date_releve, conso_val, dju_reels, dju_fiable)
+                                        VALUES (:cid, :sem, :d_str, :val, :dju, :dju_fiable)
+                                    """), {"cid": c_id, "sem": semaine_label, "d_str": d_str, "val": val, "dju": dju_val, "dju_fiable": dju_fiable_val})
                                 count += 1
                         except Exception as e:
                             erreurs.append(f"Compteur ID {c_id} : {e}")
@@ -897,7 +1049,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         with engine.connect() as conn:
             df_audit = pd.read_sql(text("""
                 SELECT a.date_modification as "Date modification", s.nom as "Bâtiment", c.numero_compteur as "N° Compteur",
-                       a.semaine_label as "Semaine", a.ancienne_valeur as "Ancienne valeur", a.nouvelle_valeur as "Nouvelle valeur"
+                       a.semaine_label as "Semaine", a.champ_modifie as "Champ modifié", a.ancienne_valeur as "Ancienne valeur", a.nouvelle_valeur as "Nouvelle valeur"
                 FROM releves_audit a
                 JOIN compteurs c ON a.compteur_id = c.id
                 JOIN sites s ON c.site_id = s.id
