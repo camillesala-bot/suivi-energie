@@ -208,22 +208,40 @@ def init_db():
                 date_modification VARCHAR(255) NOT NULL
             );
         """))
-        
+
+    # Index et migrations de colonnes : chacun dans SA PROPRE transaction (with engine.begin()
+    # séparé). Sur Postgres, une commande qui échoue "empoisonne" toute la transaction en cours —
+    # même si Python attrape l'exception, Postgres refuse ensuite toute commande suivante dans
+    # cette même transaction (ex: le SELECT COUNT(*) plus bas) tant qu'il n'y a pas eu de rollback.
+    # Isoler chaque migration évite qu'un échec ici ne fasse planter tout le reste de init_db().
+    with engine.begin() as conn:
         try:
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_releves_compteur_semaine ON releves(compteur_id, semaine_label);"))
         except Exception:
             pass
 
-        # Colonnes ajoutées après la création initiale des tables : ignore l'erreur si elles existent déjà
-        try:
-            conn.execute(text(f"ALTER TABLE releves ADD COLUMN dju_fiable {'BOOLEAN DEFAULT TRUE' if is_postgres else 'BOOLEAN DEFAULT 1'}"))
-        except Exception:
-            pass
-        try:
-            conn.execute(text("ALTER TABLE releves_audit ADD COLUMN champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
-        except Exception:
-            pass
+    if is_postgres:
+        # IF NOT EXISTS évite complètement l'erreur (donc le risque de transaction avortée)
+        # plutôt que de compter sur le try/except pour la rattraper après coup.
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE releves ADD COLUMN IF NOT EXISTS dju_fiable BOOLEAN DEFAULT TRUE"))
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE releves_audit ADD COLUMN IF NOT EXISTS champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
+    else:
+        # SQLite ne supporte pas ADD COLUMN IF NOT EXISTS de façon fiable selon les versions :
+        # on garde le try/except, mais chacun dans sa propre transaction isolée.
+        with engine.begin() as conn:
+            try:
+                conn.execute(text("ALTER TABLE releves ADD COLUMN dju_fiable BOOLEAN DEFAULT 1"))
+            except Exception:
+                pass
+        with engine.begin() as conn:
+            try:
+                conn.execute(text("ALTER TABLE releves_audit ADD COLUMN champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
+            except Exception:
+                pass
 
+    with engine.begin() as conn:
         res = conn.execute(text("SELECT COUNT(*) FROM secteurs")).scalar()
         if res == 0:
             for s in DEFAULT_SECTEURS:
