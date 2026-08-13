@@ -105,6 +105,24 @@ REFERENTIEL_EPOQUES = {
     "2001-2012 (RT 2005)": 75, "2013-2021 (RT 2012)": 50, "2022+ (RE 2020)": 30
 }
 
+# DJU 18°C annuel moyen pour la zone climatique du parc (Grenoble / Vaulnaveys).
+# Sert à pondérer la cible hebdomadaire selon la rigueur climatique réelle de la semaine.
+DJU_ANNUEL_REFERENCE = 2200
+
+# Unités valides par type d'énergie (évite les erreurs de conversion, ex: kW confondu avec kWh,
+# ou m3 utilisé pour un compteur électrique/chauffage urbain sans équivalence énergétique fiable)
+UNITES_PAR_ENERGIE = {
+    "Gaz naturel": ["m3", "kWh", "MWh"],
+    "Chauffage urbain": ["kWh", "MWh"],
+    "Électricité": ["kWh", "MWh"],
+}
+
+# DJU annuel de référence (base 18°C) utilisé pour pondérer la cible hebdomadaire
+# selon la rigueur climatique réelle de chaque semaine. Valeur indicative pour la
+# région grenobloise — à recalibrer à terme avec la moyenne des DJU réels collectés
+# par l'app sur plusieurs années complètes si vous voulez affiner la précision.
+DJU_ANNUEL_REFERENCE = 2200
+
 # --- CONNEXION BASE DE DONNÉES (SUPABASE OU SQLITE FALLBACK) ---
 @st.cache_resource
 def get_db_engine():
@@ -159,6 +177,17 @@ def init_db():
                 conso_val FLOAT NOT NULL,
                 dju_reels FLOAT NOT NULL,
                 FOREIGN KEY (compteur_id) REFERENCES compteurs(id) ON DELETE CASCADE
+            );
+        """))
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS releves_audit (
+                id {pk_auto},
+                releve_id INT NOT NULL,
+                compteur_id INT NOT NULL,
+                semaine_label VARCHAR(255) NOT NULL,
+                ancienne_valeur FLOAT NOT NULL,
+                nouvelle_valeur FLOAT NOT NULL,
+                date_modification VARCHAR(255) NOT NULL
             );
         """))
         
@@ -342,7 +371,15 @@ if menu == "📊 Dashboard Global":
         df_bat_semaine['ratio_kwh_m2'] = df_bat_semaine.apply(
             lambda r: (r['conso_mwh_eq'] * 1000) / r['surface_m2'] if r['surface_m2'] > 0 else 0.0, axis=1
         )
-        df_bat_semaine['cible_kwh'] = df_bat_semaine['epoque'].map(REFERENTIEL_EPOQUES).fillna(200) * 0.045
+        # Cible pondérée par le DJU réel de la semaine : une semaine plus froide/plus douce
+        # que la moyenne ajuste proportionnellement la consommation attendue.
+        # Repli sur l'ancien facteur fixe (0.045) uniquement si le DJU est absent ou nul.
+        df_bat_semaine['cible_kwh'] = df_bat_semaine.apply(
+            lambda r: (REFERENTIEL_EPOQUES.get(r['epoque'], 200) * (r['dju_reels'] / DJU_ANNUEL_REFERENCE))
+            if pd.notna(r['dju_reels']) and r['dju_reels'] > 0
+            else REFERENTIEL_EPOQUES.get(r['epoque'], 200) * 0.045,
+            axis=1
+        )
         df_bat_semaine['ecart_pct'] = df_bat_semaine.apply(
             lambda r: ((r['ratio_kwh_m2'] - r['cible_kwh']) / r['cible_kwh'] * 100) if r['cible_kwh'] > 0 else 0.0, axis=1
         )
@@ -412,13 +449,17 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
                 df_releves['conso_mwh_eq'] = df_releves.apply(lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite']), axis=1)
                 semaines_ordonnees = df_releves.sort_values('date_releve')['semaine_label'].unique()
 
-                pivot_compteurs = df_releves.pivot_table(index='semaine_label', columns='numero_compteur', values='conso_val', aggfunc='sum').reindex(semaines_ordonnees).fillna(0)
+                # Toutes les courbes sont converties en MWh équivalent (conso_mwh_eq) plutôt que
+                # d'afficher les valeurs brutes (conso_val) : sinon un compteur en m3 et un compteur
+                # en kWh apparaissent sur la même échelle et le graphique devient illisible/faux.
+                pivot_compteurs = df_releves.pivot_table(index='semaine_label', columns='numero_compteur', values='conso_mwh_eq', aggfunc='sum').reindex(semaines_ordonnees).fillna(0)
                 global_conso = df_releves.groupby('semaine_label')['conso_mwh_eq'].sum().reindex(semaines_ordonnees).rename("⚡ Consommation Globale (MWh eq)")
                 
                 df_courbes = pivot_compteurs.copy()
                 df_courbes['Consommation Globale (MWh eq)'] = global_conso
 
                 st.subheader("📉 Options d'affichage des courbes")
+                st.caption("ℹ️ Toutes les courbes sont exprimées en MWh équivalent, quelle que soit l'unité de relevé d'origine (m³, kWh...), pour rester comparables entre elles.")
                 toutes_courbes = list(df_courbes.columns)
                 courbes_selectionnees = st.multiselect("Choisissez les courbes à faire apparaître sur le graphique :", options=toutes_courbes, default=toutes_courbes)
 
@@ -477,12 +518,18 @@ elif menu == "📝 Saisie Hebdomadaire":
                 st.warning(dju_result["message"])
 
             with engine.connect() as conn:
+                # Le relevé précédent est déterminé par la date de relevé la plus récente avant
+                # cette semaine (avec l'id comme départage), et non par l'id max : une saisie faite
+                # en retard (rattrapage) aurait sinon pu être prise à tort pour "la plus récente".
                 df_prev = pd.read_sql(text("""
                     SELECT r.compteur_id, r.conso_val 
                     FROM releves r
-                    WHERE r.date_releve < :d_start 
-                    AND r.id IN (
-                        SELECT MAX(id) FROM releves WHERE date_releve < :d_start GROUP BY compteur_id
+                    WHERE r.date_releve < :d_start
+                    AND r.id = (
+                        SELECT r2.id FROM releves r2
+                        WHERE r2.compteur_id = r.compteur_id AND r2.date_releve < :d_start
+                        ORDER BY r2.date_releve DESC, r2.id DESC
+                        LIMIT 1
                     )
                 """), conn, params={"d_start": date_d.strftime("%Y-%m-%d")})
                 
@@ -529,35 +576,55 @@ elif menu == "📝 Saisie Hebdomadaire":
             
             if c_btn1.button("💾 Enregistrer les relevés de cette tournée", type="primary"):
                 count = 0
-                with engine.begin() as conn:
-                    for _, row in edited_grid.iterrows():
-                        val = float(row['Consommation'])
-                        if val > 0:
-                            c_id = int(row['compteur_id'])
-                            d_str = date_f.strftime("%Y-%m-%d")
-                            
-                            existing = conn.execute(
-                                text("SELECT id FROM releves WHERE compteur_id = :cid AND semaine_label = :sem"),
-                                {"cid": c_id, "sem": semaine_label}
-                            ).fetchone()
-                            
-                            if existing:
-                                conn.execute(text("""
-                                    UPDATE releves 
-                                    SET date_releve = :d_str, conso_val = :val, dju_reels = :dju
-                                    WHERE id = :rid
-                                """), {"d_str": d_str, "val": val, "dju": dju_val, "rid": existing[0]})
-                            else:
-                                conn.execute(text("""
-                                    INSERT INTO releves (compteur_id, semaine_label, date_releve, conso_val, dju_reels)
-                                    VALUES (:cid, :sem, :d_str, :val, :dju)
-                                """), {"cid": c_id, "sem": semaine_label, "d_str": d_str, "val": val, "dju": dju_val})
-                            count += 1
+                erreurs = []
+                for _, row in edited_grid.iterrows():
+                    val = float(row['Consommation'])
+                    if val > 0:
+                        c_id = int(row['compteur_id'])
+                        d_str = date_f.strftime("%Y-%m-%d")
+                        try:
+                            # Chaque ligne dans sa propre transaction : si une ligne échoue
+                            # (contrainte, conflit...), les autres lignes déjà validées restent
+                            # enregistrées au lieu d'être toutes annulées.
+                            with engine.begin() as conn:
+                                existing = conn.execute(
+                                    text("SELECT id, conso_val FROM releves WHERE compteur_id = :cid AND semaine_label = :sem"),
+                                    {"cid": c_id, "sem": semaine_label}
+                                ).fetchone()
+
+                                if existing:
+                                    ancienne_valeur = float(existing[1])
+                                    if abs(ancienne_valeur - val) > 1e-9:
+                                        conn.execute(text("""
+                                            INSERT INTO releves_audit (releve_id, compteur_id, semaine_label, ancienne_valeur, nouvelle_valeur, date_modification)
+                                            VALUES (:rid, :cid, :sem, :old, :new, :dt)
+                                        """), {"rid": existing[0], "cid": c_id, "sem": semaine_label, "old": ancienne_valeur, "new": val, "dt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                                    conn.execute(text("""
+                                        UPDATE releves 
+                                        SET date_releve = :d_str, conso_val = :val, dju_reels = :dju
+                                        WHERE id = :rid
+                                    """), {"d_str": d_str, "val": val, "dju": dju_val, "rid": existing[0]})
+                                else:
+                                    conn.execute(text("""
+                                        INSERT INTO releves (compteur_id, semaine_label, date_releve, conso_val, dju_reels)
+                                        VALUES (:cid, :sem, :d_str, :val, :dju)
+                                    """), {"cid": c_id, "sem": semaine_label, "d_str": d_str, "val": val, "dju": dju_val})
+                                count += 1
+                        except Exception as e:
+                            erreurs.append(f"Compteur ID {c_id} : {e}")
+
+                if erreurs:
+                    st.error(f"⚠️ {len(erreurs)} relevé(s) n'ont pas pu être enregistrés :")
+                    for err in erreurs:
+                        st.error(err)
+
                 if count > 0:
-                    set_flash(f"Les relevés de {count} sous-compteur(s) ont été enregistrés avec succès dans Supabase pour la semaine '{semaine_label}' !", "success")
-                else:
+                    msg = f"Les relevés de {count} sous-compteur(s) ont été enregistrés avec succès dans Supabase pour la semaine '{semaine_label}' !"
+                    set_flash(msg, "success")
+                    st.rerun()
+                elif not erreurs:
                     set_flash("Avertissement : Aucune valeur supérieure à 0 n'a été renseignée.", "error")
-                st.rerun()
+                    st.rerun()
 
             df_export_hebdo = edited_grid[['Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Relevé S-1 (Précédent)', 'Consommation']].copy()
             c_btn2.download_button(
@@ -575,9 +642,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     st.markdown('<div class="main-header"><h2>⚙️ Administration du Parc</h2><span>Gestion des sites, édition des compteurs et réorganisation de l\'ordre des bâtiments</span></div>', unsafe_allow_html=True)
     display_flash()
     
-    tab_add_site, tab_edit_site, tab_ordre_sites, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list = st.tabs([
+    tab_add_site, tab_edit_site, tab_ordre_sites, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
         "➕ Ajouter Bâtiment", "✏️ Modifier Site", "🔢 Ordre des Bâtiments",
-        "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", "🏷️ Renommer Secteurs", "📋 Liste Globale"
+        "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", "🏷️ Renommer Secteurs", "📋 Liste Globale", "🕓 Historique des Modifications"
     ])
 
     with tab_add_site:
@@ -695,10 +762,15 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     sel_site_label = st.selectbox("Bâtiment concerné", list(site_dict_add.keys()))
                     num_c = st.text_input("Numéro du sous-compteur (ex: GAZ-SUB-01)")
                     type_e = st.selectbox("Type d'énergie", ["Gaz naturel", "Chauffage urbain", "Électricité"])
-                    unite_c = st.selectbox("Unité de mesure", ["m3", "MWh", "kWh", "kW"])
-                    
+                    unite_c = st.selectbox("Unité de mesure", ["m3", "MWh", "kWh"])
+                    st.caption("ℹ️ L'unité 'm³' n'est cohérente que pour le gaz naturel (conversion ≈10 kWh/m³). Pour l'électricité et le chauffage urbain, utilisez kWh ou MWh.")
+
                     if st.form_submit_button("Ajouter le sous-compteur", type="primary"):
-                        if num_c.strip():
+                        if not num_c.strip():
+                            st.error("Le numéro de sous-compteur ne peut pas être vide.")
+                        elif unite_c not in UNITES_PAR_ENERGIE.get(type_e, []):
+                            st.error(f"L'unité '{unite_c}' n'est pas cohérente avec '{type_e}'. Unités valides : {', '.join(UNITES_PAR_ENERGIE.get(type_e, []))}.")
+                        else:
                             target_site_id = site_dict_add[sel_site_label]
                             try:
                                 with engine.begin() as conn:
@@ -710,8 +782,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 st.rerun()
                             except Exception:
                                 st.error("Ce numéro de compteur existe déjà dans la base.")
-                        else:
-                            st.error("Le numéro de sous-compteur ne peut pas être vide.")
 
     with tab_edit_compteur:
         st.subheader("✏️ Modifier, Réattribuer ou Supprimer un Sous-Compteur")
@@ -745,14 +815,17 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     nouveau_num = st.text_input("Numéro du sous-compteur", value=c_actuel['numero_compteur'])
                     energies_possibles = ["Gaz naturel", "Chauffage urbain", "Électricité"]
                     nouveau_type = st.selectbox("Type d'énergie", energies_possibles, index=energies_possibles.index(c_actuel['type_energie']) if c_actuel['type_energie'] in energies_possibles else 0)
-                    unites_possibles = ["m3", "MWh", "kWh", "kW"]
+                    unites_possibles = ["m3", "MWh", "kWh"]
                     nouvelle_unite = st.selectbox("Unité de mesure", unites_possibles, index=unites_possibles.index(c_actuel['unite']) if c_actuel['unite'] in unites_possibles else 0)
-                    
+                    st.caption("ℹ️ L'unité 'm³' n'est cohérente que pour le gaz naturel (conversion ≈10 kWh/m³). Pour l'électricité et le chauffage urbain, utilisez kWh ou MWh.")
+
                     submitted_save_compteur = st.form_submit_button("💾 Enregistrer les modifications", type="primary")
                     
                     if submitted_save_compteur:
                         if not nouveau_num.strip():
                             st.error("Le numéro de sous-compteur ne peut pas être vide.")
+                        elif nouvelle_unite not in UNITES_PAR_ENERGIE.get(nouveau_type, []):
+                            st.error(f"L'unité '{nouvelle_unite}' n'est pas cohérente avec '{nouveau_type}'. Unités valides : {', '.join(UNITES_PAR_ENERGIE.get(nouveau_type, []))}.")
                         else:
                             with engine.begin() as conn:
                                 conn.execute(text("""
@@ -817,3 +890,22 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
             use_container_width=True
         )
         st.dataframe(df_all, hide_index=True, use_container_width=True)
+
+    with tab_historique:
+        st.subheader("🕓 Historique des corrections de relevés")
+        st.caption("Chaque fois qu'un relevé déjà enregistré est modifié (et non simplement créé), l'ancienne et la nouvelle valeur sont tracées ici.")
+        with engine.connect() as conn:
+            df_audit = pd.read_sql(text("""
+                SELECT a.date_modification as "Date modification", s.nom as "Bâtiment", c.numero_compteur as "N° Compteur",
+                       a.semaine_label as "Semaine", a.ancienne_valeur as "Ancienne valeur", a.nouvelle_valeur as "Nouvelle valeur"
+                FROM releves_audit a
+                JOIN compteurs c ON a.compteur_id = c.id
+                JOIN sites s ON c.site_id = s.id
+                ORDER BY a.id DESC
+                LIMIT 100
+            """), conn)
+
+        if df_audit.empty:
+            st.info("Aucune correction de relevé enregistrée pour le moment.")
+        else:
+            st.dataframe(df_audit, hide_index=True, use_container_width=True)
