@@ -47,8 +47,6 @@ st.markdown("""
 # ==============================================================================
 # AUTHENTIFICATION AVEC EXPIRATION GLISSANTE (20 MINUTES)
 # ==============================================================================
-# La session reste active tant que l'agent interagit. Après 20 minutes (1200s) sans action,
-# la session est invalidée et l'accès est à nouveau verrouillé.
 SESSION_TIMEOUT_SECONDS = 20 * 60
 
 if "authenticated" not in st.session_state:
@@ -59,24 +57,23 @@ if "last_activity" not in st.session_state:
 def check_password():
     current_time = time.time()
     
-    # 1. Vérification du délai d'inactivité si l'utilisateur est déjà connecté
+    # 1. Vérification du délai d'inactivité
     if st.session_state["authenticated"]:
         time_elapsed = current_time - st.session_state.get("last_activity", current_time)
         if time_elapsed > SESSION_TIMEOUT_SECONDS:
             st.session_state["authenticated"] = False
             st.warning("⏱️ Votre session a expiré après 20 minutes d'inactivité. Veuillez vous reconnecter.")
             return False
-        # Réinitialisation de l'horodatage à chaque interaction (timeout glissant)
         st.session_state["last_activity"] = current_time
         return True
 
-    # 2. Écran de connexion si non-authentifié
+    # 2. Écran de connexion
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown('<div class="main-header" style="text-align: center;"><h2>🔒 Accès Sécurisé</h2><span>Suivi Énergétique du Parc Municipal</span></div>', unsafe_allow_html=True)
         expected_pwd = st.secrets.get("APP_PASSWORD")
         if not expected_pwd:
-            st.error("⚠️ Aucun mot de passe (APP_PASSWORD) n'est configuré dans les secrets de l'application. Accès bloqué.")
+            st.error("⚠️ Aucun mot de passe (APP_PASSWORD) n'est configuré dans les secrets. Accès bloqué.")
             st.stop()
             
         with st.form("form_login"):
@@ -114,7 +111,7 @@ def display_flash():
             st.info(msg, icon="ℹ️")
 
 # ==============================================================================
-# CONSTANTES ET RÉFÉRENTIELS
+# CONSTANTES ET RÉFÉRENTIELS (INCLUANT EAU FROIDE, ECS & EAU GLACÉE)
 # ==============================================================================
 DEFAULT_SECTEURS = [
     "Secteur 1 - Centre / Administratif",
@@ -133,11 +130,18 @@ REFERENTIEL_EPOQUES = {
 }
 
 DELAI_DJU_JOURS = 5
+
+# Dictionnaire des unités autorisées par type de fluide / énergie
 UNITES_PAR_ENERGIE = {
     "Gaz naturel": ["m3", "kWh", "MWh"],
     "Chauffage urbain": ["kWh", "MWh"],
     "Électricité": ["kWh", "MWh"],
+    "Eau froide": ["m3"],
+    "ECS": ["m3", "kWh", "MWh"],
+    "Eau glacée": ["kWh", "MWh", "m3"],
 }
+
+LISTE_TYPES_ENERGIE = list(UNITES_PAR_ENERGIE.keys())
 DJU_ANNUEL_REFERENCE = 2010
 
 # ==============================================================================
@@ -149,8 +153,6 @@ def get_db_engine():
         db_url = st.secrets["db"]["url"]
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
-        # Pool dimensionné pour ~20 agents simultanés le lundi matin.
-        # pool_recycle évite les connexions "mortes" entre deux sessions de relevé.
         return create_engine(
             db_url,
             pool_pre_ping=True,
@@ -176,7 +178,6 @@ def init_db():
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves (id {pk_auto}, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, date_releve DATE NOT NULL, conso_val FLOAT NOT NULL, dju_reels FLOAT NOT NULL, FOREIGN KEY (compteur_id) REFERENCES compteurs(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves_audit (id {pk_auto}, releve_id INT NOT NULL, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, ancienne_valeur FLOAT NOT NULL, nouvelle_valeur FLOAT NOT NULL, date_modification VARCHAR(255) NOT NULL);"))
 
-    # Index isolés dans leurs propres transactions pour éviter d'empoisonner les connexions Postgres
     with engine.begin() as conn:
         try: conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_releves_compteur_semaine ON releves(compteur_id, semaine_label);"))
         except Exception: pass
@@ -206,7 +207,7 @@ def init_db():
 init_db()
 
 # ==============================================================================
-# FONCTIONS DE REQUÊTES EN CACHE (AVEC INVALIDATION CIBLÉE)
+# FONCTIONS DE REQUÊTES EN CACHE
 # ==============================================================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_secteurs_list():
@@ -216,7 +217,6 @@ def get_secteurs_list():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_compteurs_par_secteur(secteur_filtre):
-    """Mise en cache du répertoire des compteurs filtrés par tournée."""
     with engine.connect() as conn:
         query = """
             SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ordre as "Ordre",
@@ -232,15 +232,9 @@ def get_compteurs_par_secteur(secteur_filtre):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_releves_s1_et_actuels(compteur_ids_tuple, date_d_str, semaine_label):
-    """
-    Récupère le relevé S-1 et le relevé déjà saisi pour la semaine en cours.
-    Seules les sous-requêtes filtrées par les IDs de la tournée sont exécutées.
-    L'utilisation d'un tuple permet à Streamlit de hasher le paramètre pour le cache.
-    """
     if not compteur_ids_tuple:
         return {}, {}
     with engine.connect() as conn:
-        # Relevé S-1 déterminé par la date la plus récente avant cette semaine
         df_prev = pd.read_sql(
             text("""
                 SELECT r.compteur_id, r.conso_val 
@@ -258,7 +252,6 @@ def get_releves_s1_et_actuels(compteur_ids_tuple, date_d_str, semaine_label):
         )
         dict_prev = dict(zip(df_prev['compteur_id'], df_prev['conso_val'])) if not df_prev.empty else {}
 
-        # Relevés déjà saisis pour la semaine sélectionnée
         df_existants = pd.read_sql(
             text("SELECT compteur_id, conso_val FROM releves WHERE semaine_label = :sem AND compteur_id IN :ids").bindparams(bindparam("ids", expanding=True)),
             conn, params={"sem": semaine_label, "ids": list(compteur_ids_tuple)}
@@ -268,7 +261,7 @@ def get_releves_s1_et_actuels(compteur_ids_tuple, date_d_str, semaine_label):
     return dict_prev, dict_existants
 
 # ==============================================================================
-# FONCTIONS UTILITAIRES & MÉTÉO OPEN-METEO
+# UTILITAIRES & CONVERSION D'ÉNERGIE
 # ==============================================================================
 def generate_excel_bytes(df: pd.DataFrame, sheet_name="Données") -> bytes:
     output = io.BytesIO()
@@ -291,15 +284,24 @@ def get_saison_chauffe(d) -> str:
     if d.month >= MOIS_DEBUT_SAISON: return f"{d.year}/{d.year + 1}"
     else: return f"{d.year - 1}/{d.year}"
 
-def convertir_en_mwh_equivalent(valeur: float, unite: str) -> float:
-    if valeur is None or pd.isna(valeur): return 0.0
+def convertir_en_mwh_equivalent(valeur: float, unite: str, type_energie: str = "") -> float:
+    if valeur is None or pd.isna(valeur): 
+        return 0.0
+    
+    # L'eau froide est exclue du cumul MWh énergétique du Dashboard
+    if type_energie == "Eau froide":
+        return 0.0
+        
     unite = str(unite).lower().strip()
-    if unite in ['mwh']: return float(valeur)
-    elif unite in ['m3']: return float(valeur) * 0.01
-    elif unite in ['kwh', 'kw']: return float(valeur) / 1000.0
+    if unite in ['mwh']: 
+        return float(valeur)
+    elif unite in ['m3']: 
+        # Pour le Gaz, l'ECS ou l'Eau glacée comptabilisés en m³ (~10 kWh/m³)
+        return float(valeur) * 0.01
+    elif unite in ['kwh', 'kw']: 
+        return float(valeur) / 1000.0
     return float(valeur)
 
-# Le SPINNER MÉTÉO est restauré pour éviter que l'écran ne paraisse gelé pendant l'appel API
 @st.cache_data(ttl=3600, show_spinner="☁️ Récupération de la météo réelle via Open-Meteo...")
 def _fetch_dju_hebdo_raw(date_debut_str: str, date_fin_str: str, lat: float, lon: float) -> dict:
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -341,7 +343,7 @@ def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73)
     
     if result["jours_valides"] < result["jours_total"]:
         manquants = result["jours_total"] - result["jours_valides"]
-        return {"dju": result["dju"], "fiable": False, "message": f"⚠️ Données météo incomplètes ({manquants} jour(s) pas encore disponibles sur l'API). DJU susceptible d'être sous-évalué."}
+        return {"dju": result["dju"], "fiable": False, "message": f"⚠️ Données météo incomplètes ({manquants} jour(s) manquants sur l'API)."}
     return {"dju": result["dju"], "fiable": True, "message": None}
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -387,7 +389,7 @@ with st.sidebar:
     menu = st.radio(
         "Navigation", 
         ["📊 Dashboard Global", "📈 Analyse & Courbes par Bâtiment", "🔥 Efficacité MWh/DJU", "📝 Saisie Hebdomadaire", "⚙️ Gestion Sites, Compteurs & Secteurs"],
-        index=3  # Onglet Saisie actif par défaut
+        index=3
     )
 
 LISTE_SECTEURS = get_secteurs_list()
@@ -395,7 +397,7 @@ LISTE_SECTEURS = get_secteurs_list()
 try:
     nb_dju_corriges = refresh_stale_dju()
     if nb_dju_corriges > 0:
-        set_flash(f"🛠️ Le DJU de {nb_dju_corriges} semaine(s) a été corrigé automatiquement avec la météo définitive.", "info")
+        set_flash(f"🛠️ Le DJU de {nb_dju_corriges} semaine(s) a été mis à jour automatiquement.", "info")
 except Exception: pass
 
 
@@ -410,7 +412,7 @@ if menu == "📊 Dashboard Global":
         df_semaines = pd.read_sql(text("SELECT DISTINCT semaine_label, date_releve FROM releves ORDER BY date_releve DESC"), conn)
     
     if df_semaines.empty:
-        st.info("👋 Aucun relevé enregistré. Rendez-vous dans 'Gestion Sites, Compteurs & Secteurs' pour commencer.")
+        st.info("👋 Aucun relevé enregistré.")
     else:
         semaines_dispo = df_semaines.sort_values('date_releve', ascending=False)['semaine_label'].tolist()
         semaine_sel = st.selectbox("Sélectionner la semaine d'analyse", semaines_dispo)
@@ -425,7 +427,10 @@ if menu == "📊 Dashboard Global":
                 WHERE r.semaine_label = :sem
             """), conn, params={"sem": semaine_sel})
             
-        df_semaine['conso_mwh_eq'] = df_semaine.apply(lambda row: convertir_en_mwh_equivalent(row['conso_val'], row['unite']), axis=1)
+        df_semaine['conso_mwh_eq'] = df_semaine.apply(
+            lambda row: convertir_en_mwh_equivalent(row['conso_val'], row['unite'], row['type_energie']), 
+            axis=1
+        )
         df_bat_semaine = df_semaine.groupby(['site_nom', 'secteur', 'surface_m2', 'epoque', 'ordre']).agg({'conso_mwh_eq': 'sum', 'dju_reels': 'mean'}).reset_index().sort_values(by=['ordre', 'site_nom'])
         df_bat_semaine['ratio_kwh_m2'] = df_bat_semaine.apply(lambda r: (r['conso_mwh_eq'] * 1000) / r['surface_m2'] if r['surface_m2'] > 0 else 0.0, axis=1)
         df_bat_semaine['cible_kwh'] = df_bat_semaine.apply(
@@ -436,14 +441,14 @@ if menu == "📊 Dashboard Global":
 
         k1, k2, k3, k4 = st.columns(4)
         k1.markdown(f'<div class="kpi-card"><div class="kpi-title">Bâtiments Actifs</div><div class="kpi-value">{len(df_bat_semaine)}</div></div>', unsafe_allow_html=True)
-        k2.markdown(f'<div class="kpi-card"><div class="kpi-title">Conso Totale</div><div class="kpi-value">{df_bat_semaine["conso_mwh_eq"].sum():.1f} <span style="font-size:1rem;">MWh eq</span></div></div>', unsafe_allow_html=True)
+        k2.markdown(f'<div class="kpi-card"><div class="kpi-title">Conso Totale Équiv.</div><div class="kpi-value">{df_bat_semaine["conso_mwh_eq"].sum():.1f} <span style="font-size:1rem;">MWh eq</span></div></div>', unsafe_allow_html=True)
         k3.markdown(f'<div class="kpi-card"><div class="kpi-title">Météo Moyenne</div><div class="kpi-value">{df_bat_semaine["dju_reels"].mean():.1f} <span style="font-size:1rem;">DJU</span></div></div>', unsafe_allow_html=True)
         anomalies = df_bat_semaine[df_bat_semaine['ecart_pct'] > 25]
         k4.markdown(f'<div class="kpi-card {"kpi-card-danger" if len(anomalies)>0 else ""}"><div class="kpi-title">Bâtiments en Dérive</div><div class="kpi-value">{len(anomalies)}</div></div>', unsafe_allow_html=True)
 
         st.divider()
         col_t1, col_t2 = st.columns([3, 1])
-        col_t1.subheader("📋 Synthèse par Bâtiment (Cumul des sous-compteurs)")
+        col_t1.subheader("📋 Synthèse par Bâtiment")
         df_export_dash = df_bat_semaine[['site_nom', 'secteur', 'surface_m2', 'conso_mwh_eq', 'ratio_kwh_m2', 'ecart_pct']].rename(
             columns={'site_nom': 'Bâtiment', 'surface_m2': 'Surface (m²)', 'conso_mwh_eq': 'Conso Équiv. (MWh)', 'ratio_kwh_m2': 'kWh/m²', 'ecart_pct': 'Écart Cible (%)'}
         )
@@ -452,10 +457,10 @@ if menu == "📊 Dashboard Global":
 
 
 # ==============================================================================
-# TAB 2: ANALYSE PAR BÂTIMENT ET COURBES MULTI-AXES
+# TAB 2: ANALYSE PAR BÂTIMENT ET COURBES
 # ==============================================================================
 elif menu == "📈 Analyse & Courbes par Bâtiment":
-    st.markdown('<div class="main-header"><h2>📈 Analyse Détaillée & Courbes par Bâtiment</h2><span>Comparaison consommation et rigueur météo</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h2>📈 Analyse Détaillée & Courbes par Bâtiment</h2></div>', unsafe_allow_html=True)
     display_flash()
     
     with engine.connect() as conn:
@@ -485,7 +490,10 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
             
-            df_releves['conso_mwh_eq'] = df_releves.apply(lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite']), axis=1)
+            df_releves['conso_mwh_eq'] = df_releves.apply(
+                lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite'], r['type_energie']), 
+                axis=1
+            )
             semaines_ord = df_releves.sort_values('date_releve')['semaine_label'].unique()
             pivot_compteurs = df_releves.pivot_table(index='semaine_label', columns='numero_compteur', values='conso_mwh_eq', aggfunc='sum').reindex(semaines_ord).fillna(0)
             pivot_compteurs['Consommation Globale (MWh eq)'] = df_releves.groupby('semaine_label')['conso_mwh_eq'].sum().reindex(semaines_ord)
@@ -512,7 +520,7 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
 # TAB 3: EFFICACITÉ MWh/DJU (CHAUFFAGE GAZ + URBAIN)
 # ==============================================================================
 elif menu == "🔥 Efficacité MWh/DJU":
-    st.markdown('<div class="main-header"><h2>🔥 Efficacité par DJU</h2><span>Consommation de chauffage rapportée au climat de chaque saison</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h2>🔥 Efficacité par DJU</h2><span>Chauffage (Gaz + Urbain) ramené à la rigueur climatique</span></div>', unsafe_allow_html=True)
     display_flash()
     
     with engine.connect() as conn:
@@ -524,7 +532,7 @@ elif menu == "🔥 Efficacité MWh/DJU":
     if df_eff.empty:
         st.info("Aucune donnée de chauffage enregistrée pour le moment.")
     else:
-        df_eff['conso_mwh_eq'] = df_eff.apply(lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite']), axis=1)
+        df_eff['conso_mwh_eq'] = df_eff.apply(lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite'], r['type_energie']), axis=1)
         df_eff['date_releve'] = pd.to_datetime(df_eff['date_releve'])
         df_eff['saison'] = df_eff['date_releve'].apply(get_saison_chauffe)
         
@@ -540,10 +548,10 @@ elif menu == "🔥 Efficacité MWh/DJU":
 
 
 # ==============================================================================
-# TAB 4: SAISIE HEBDOMADAIRE (OPTIMISÉE AVEC @st.fragment)
+# TAB 4: SAISIE HEBDOMADAIRE (@st.fragment ISOLÉ)
 # ==============================================================================
 elif menu == "📝 Saisie Hebdomadaire":
-    st.markdown('<div class="main-header"><h2>📝 Saisie des Index par Compteur</h2><span>Relevé hebdomadaire par tournée / secteur</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h2>📝 Saisie des Index par Compteur</h2><span>Relevé rapide sur le terrain</span></div>', unsafe_allow_html=True)
     display_flash()
 
     secteur_filtre = st.selectbox("📌 Filtrer par secteur / tournée :", ["Tous les secteurs"] + LISTE_SECTEURS)
@@ -562,16 +570,11 @@ elif menu == "📝 Saisie Hebdomadaire":
         selected_week_data = next(w for w in all_weeks if w["label"] == selected_week_label)
         date_d, date_f = selected_week_data["mon"], selected_week_data["sun"]
 
-        # Récupération de la météo pour la semaine choisie
         dju_result = fetch_dju_hebdo(date_d.strftime("%Y-%m-%d"), date_f.strftime("%Y-%m-%d"))
         dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
         if dju_result["message"]: st.warning(dju_result["message"])
         dju_fiable_val = True if abs(dju_val - dju_result["dju"]) > 1e-9 else dju_result["fiable"]
 
-        # ----------------------------------------------------------------------
-        # COMPOSANT ISOLÉ PAR @st.fragment : Seul ce bloc se réexécute lors de
-        # la modification d'une case dans le tableau (évite la recharge globale).
-        # ----------------------------------------------------------------------
         @st.fragment
         def render_tableau_saisie(df_c, sem_label, dt_d, dt_f, dju_v, dju_f_val):
             c_ids = tuple(df_c['compteur_id'].tolist())
@@ -590,7 +593,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
                     "Énergie": st.column_config.TextColumn(disabled=True),
                     "Unité": st.column_config.TextColumn(disabled=True),
-                    "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1 (Précédent)", disabled=True, format="%.1f"),
+                    "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1", disabled=True, format="%.1f"),
                     "Consommation": st.column_config.NumberColumn("Valeur / Index Conso", min_value=0.0, step=0.1)
                 },
                 hide_index=True, use_container_width=True, num_rows="fixed",
@@ -600,7 +603,6 @@ elif menu == "📝 Saisie Hebdomadaire":
             c_btn1, c_btn2 = st.columns([2, 1])
             if c_btn1.button("💾 Enregistrer les relevés de cette tournée", type="primary"):
                 count, erreurs = 0, []
-                # Une seule transaction SQL globale pour l'ensemble des compteurs enregistrés
                 with engine.begin() as conn:
                     for _, row in edited_grid.iterrows():
                         val = float(row['Consommation'])
@@ -608,7 +610,6 @@ elif menu == "📝 Saisie Hebdomadaire":
                             c_id = int(row['compteur_id'])
                             d_str = dt_f.strftime("%Y-%m-%d")
                             try:
-                                # SAVEPOINT SQL (begin_nested) pour isoler les erreurs ligne par ligne
                                 with conn.begin_nested():
                                     existing = conn.execute(text("SELECT id, conso_val FROM releves WHERE compteur_id = :cid AND semaine_label = :sem"), {"cid": c_id, "sem": sem_label}).fetchone()
                                     if existing:
@@ -630,7 +631,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                             except Exception as e:
                                 erreurs.append(f"Compteur ID {c_id} : {e}")
 
-                # INVALIDATION CIBLÉE DU CACHE (Conserve le cache Open-Meteo intact !)
+                # Invalidation ciblée
                 get_releves_s1_et_actuels.clear()
                 get_compteurs_par_secteur.clear()
 
@@ -648,7 +649,7 @@ elif menu == "📝 Saisie Hebdomadaire":
 
 
 # ==============================================================================
-# TAB 5: GESTION SITES, COMPTEURS & SECTEURS (8 SOUS-ONGLETS COMPLETS)
+# TAB 5: GESTION ET ADMINISTRATION (8 SOUS-ONGLETS COMPLETS)
 # ==============================================================================
 elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     st.markdown('<div class="main-header"><h2>⚙️ Administration du Parc</h2><span>Gestion des sites, édition des sous-compteurs et réorganisation</span></div>', unsafe_allow_html=True)
@@ -740,7 +741,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     
                     get_compteurs_par_secteur.clear()
                     get_releves_s1_et_actuels.clear()
-                    set_flash(f"Le bâtiment '{site_actuel['nom']}' et l'ensemble de ses sous-compteurs ont été supprimés !", "info")
+                    set_flash(f"Le bâtiment '{site_actuel['nom']}' et ses sous-compteurs ont été supprimés !", "info")
                     st.rerun()
 
     # --------------------------------------------------------------------------
@@ -759,7 +760,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     "id": None,
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
                     "Secteur": st.column_config.TextColumn(disabled=True),
-                    "Ordre": st.column_config.NumberColumn("Ordre d'affichage (ex: 1, 2, 3...)", min_value=0, step=1)
+                    "Ordre": st.column_config.NumberColumn("Ordre d'affichage", min_value=0, step=1)
                 },
                 hide_index=True, use_container_width=True, key="grid_reordre_sites"
             )
@@ -773,7 +774,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # 4. AJOUTER SOUS-COMPTEUR
+    # 4. AJOUTER SOUS-COMPTEUR (AVEC NOUVEAUX FLUIDES)
     # --------------------------------------------------------------------------
     with tab_add_compteur:
         st.subheader("➕ Rattacher un sous-compteur à un bâtiment")
@@ -790,10 +791,11 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 site_dict_add = {f"{s['nom']} ({s['secteur']})": int(s['id']) for s in sites_filtered}
                 with st.form("form_add_subcompteur"):
                     sel_site_label = st.selectbox("Bâtiment concerné", list(site_dict_add.keys()))
-                    num_c = st.text_input("Numéro du sous-compteur (ex: GAZ-SUB-01)")
-                    type_e = st.selectbox("Type d'énergie", ["Gaz naturel", "Chauffage urbain", "Électricité"])
-                    unite_c = st.selectbox("Unité de mesure", ["m3", "MWh", "kWh"])
-                    st.caption("ℹ️ L'unité 'm³' est destinée au gaz naturel (conversion ≈10 kWh/m³). Pour l'électricité et le chauffage urbain, utilisez kWh ou MWh.")
+                    num_c = st.text_input("Numéro du sous-compteur (ex: EF-SUB-01, CLIM-EG-01)")
+                    
+                    type_e = st.selectbox("Type d'énergie / Fluide", LISTE_TYPES_ENERGIE)
+                    unite_c = st.selectbox("Unité de mesure", ["m3", "kWh", "MWh"])
+                    st.caption("ℹ️ 'm³' convient pour le gaz, l'eau froide et l'ECS. Pour l'électricité, le chauffage urbain et l'eau glacée, utilisez kWh ou MWh.")
                     
                     if st.form_submit_button("Ajouter le sous-compteur", type="primary"):
                         if not num_c.strip():
@@ -809,7 +811,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                     """), {"sid": site_dict_add[sel_site_label], "num": num_c.strip(), "type_e": type_e, "unite": unite_c})
                                 
                                 get_compteurs_par_secteur.clear()
-                                set_flash(f"Le sous-compteur '{num_c.strip()}' a été ajouté avec succès !", "success")
+                                set_flash(f"Le sous-compteur '{num_c.strip()}' ({type_e}) a été ajouté avec succès !", "success")
                                 st.rerun()
                             except Exception:
                                 st.error("🚨 Ce numéro de sous-compteur existe déjà dans la base.")
@@ -847,8 +849,10 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     nouveau_site_label = st.selectbox("🏢 Bâtiment rattaché (Réattribution)", list(site_options.keys()), index=default_site_idx)
                     nouveau_site_id = site_options[nouveau_site_label]
                     nouveau_num = st.text_input("Numéro du sous-compteur", value=c_actuel['numero_compteur'])
-                    energies_possibles = ["Gaz naturel", "Chauffage urbain", "Électricité"]
-                    nouveau_type = st.selectbox("Type d'énergie", energies_possibles, index=energies_possibles.index(c_actuel['type_energie']) if c_actuel['type_energie'] in energies_possibles else 0)
+                    
+                    energies_possibles = LISTE_TYPES_ENERGIE
+                    nouveau_type = st.selectbox("Type d'énergie / Fluide", energies_possibles, index=energies_possibles.index(c_actuel['type_energie']) if c_actuel['type_energie'] in energies_possibles else 0)
+                    
                     unites_possibles = ["m3", "MWh", "kWh"]
                     nouvelle_unite = st.selectbox("Unité de mesure", unites_possibles, index=unites_possibles.index(c_actuel['unite']) if c_actuel['unite'] in unites_possibles else 0)
                     
@@ -917,7 +921,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 7. LISTE GLOBALE
+    # 7. LISTE GLOBALE DU PARC
     # --------------------------------------------------------------------------
     with tab_list:
         with engine.connect() as conn:
