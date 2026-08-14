@@ -155,6 +155,7 @@ def get_db_engine():
 
 engine = get_db_engine()
 
+@st.cache_resource
 def init_db():
     is_postgres = "postgresql" in str(engine.url)
     pk_auto = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -265,6 +266,7 @@ def get_all_weeks_of_year(year: int):
         weeks.append({"label": label, "week_num": w, "mon": mon, "sun": sun})
     return weeks
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_secteurs_list():
     with engine.connect() as conn:
         df = pd.read_sql(text("SELECT nom FROM secteurs ORDER BY id"), conn)
@@ -365,7 +367,7 @@ def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73)
     return {"dju": result["dju"], "fiable": True, "message": None}
 
 
-@st.cache_data(ttl=21600, show_spinner=False)  # 6h : évite de relancer la vérification à chaque page vue
+@st.cache_data(ttl=21600, show_spinner="🌡️ Vérification des données météo en attente de confirmation…")
 def refresh_stale_dju():
     """
     Recherche les semaines dont le DJU avait été enregistré comme "non fiable" (données météo
@@ -374,7 +376,13 @@ def refresh_stale_dju():
     Ne touche jamais à une valeur corrigée manuellement par un agent (voir dju_fiable_val
     dans l'onglet Saisie : une modification manuelle marque la ligne comme déjà fiable).
     Retourne le nombre de semaines corrigées.
+
+    Limité à MAX_SEMAINES_PAR_VERIFICATION par appel : en cas de gros retard accumulé,
+    ça évite qu'une seule ouverture de l'app ne reste bloquée trop longtemps à enchaîner
+    les appels réseau (le reste sera traité aux prochains cycles de 6h).
     """
+    MAX_SEMAINES_PAR_VERIFICATION = 3
+
     limite = (date.today() - timedelta(days=DELAI_DJU_JOURS)).strftime("%Y-%m-%d")
     with engine.connect() as conn:
         semaines_a_verifier = pd.read_sql(text("""
@@ -382,7 +390,8 @@ def refresh_stale_dju():
             FROM releves
             WHERE dju_fiable = FALSE AND date_releve <= :limite
             GROUP BY semaine_label
-        """), conn, params={"limite": limite})
+            LIMIT :max_semaines
+        """), conn, params={"limite": limite, "max_semaines": MAX_SEMAINES_PAR_VERIFICATION})
 
     nb_semaines_corrigees = 0
     for _, row in semaines_a_verifier.iterrows():
@@ -447,23 +456,31 @@ if menu == "📊 Dashboard Global":
     st.markdown('<div class="main-header"><h2>📊 Tableau de Bord Multi-Énergies</h2><span>Vue consolidée des bâtiments et de leurs sous-compteurs</span></div>', unsafe_allow_html=True)
     display_flash()
     
+    # Requête légère : uniquement la liste des semaines disponibles, sans les jointures.
+    # Le détail complet (jointures compteurs/sites) n'est chargé qu'une fois la semaine
+    # choisie ci-dessous — évite de rapatrier tout l'historique à chaque ouverture du Dashboard.
     with engine.connect() as conn:
-        df_releves = pd.read_sql(text("""
-            SELECT r.*, c.numero_compteur, c.type_energie, c.unite, 
-                   s.nom as site_nom, s.secteur, s.surface_m2, s.epoque, s.ordre
-            FROM releves r 
-            JOIN compteurs c ON r.compteur_id = c.id
-            JOIN sites s ON c.site_id = s.id
-            ORDER BY r.date_releve DESC
+        df_semaines = pd.read_sql(text("""
+            SELECT DISTINCT semaine_label, date_releve
+            FROM releves
+            ORDER BY date_releve DESC
         """), conn)
 
-    if df_releves.empty:
+    if df_semaines.empty:
         st.info("👋 Aucun relevé enregistré. Rendez-vous dans l'onglet **Gestion Sites, Compteurs & Secteurs** pour ajouter vos bâtiments.")
     else:
-        semaines_dispo = df_releves[['semaine_label', 'date_releve']].drop_duplicates().sort_values('date_releve', ascending=False)['semaine_label'].tolist()
+        semaines_dispo = df_semaines.sort_values('date_releve', ascending=False)['semaine_label'].tolist()
         semaine_sel = st.selectbox("Sélectionner la semaine d'analyse", semaines_dispo)
 
-        df_semaine = df_releves[df_releves['semaine_label'] == semaine_sel].copy()
+        with engine.connect() as conn:
+            df_semaine = pd.read_sql(text("""
+                SELECT r.*, c.numero_compteur, c.type_energie, c.unite,
+                       s.nom as site_nom, s.secteur, s.surface_m2, s.epoque, s.ordre
+                FROM releves r
+                JOIN compteurs c ON r.compteur_id = c.id
+                JOIN sites s ON c.site_id = s.id
+                WHERE r.semaine_label = :sem
+            """), conn, params={"sem": semaine_sel})
         df_semaine['conso_mwh_eq'] = df_semaine.apply(lambda row: convertir_en_mwh_equivalent(row['conso_val'], row['unite']), axis=1)
         
         df_bat_semaine = df_semaine.groupby(['site_nom', 'secteur', 'surface_m2', 'epoque', 'ordre']).agg({
@@ -1038,6 +1055,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                             if old_name != new_name:
                                 conn.execute(text("UPDATE secteurs SET nom = :n WHERE id = :sid"), {"n": new_name, "sid": sec_id})
                                 conn.execute(text("UPDATE sites SET secteur = :n WHERE secteur = :old"), {"n": new_name, "old": old_name})
+                    get_secteurs_list.clear()
                     set_flash("Tous les secteurs ont été renommés avec succès !", "success")
                     st.rerun()
 
