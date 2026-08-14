@@ -45,7 +45,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# AUTHENTIFICATION AVEC EXPIRATION GLISSANTE (20 MINUTES)
+# AUTHENTIFICATION GLOBALE (EXPIRATION GLISSANTE 20 MINUTES)
 # ==============================================================================
 SESSION_TIMEOUT_SECONDS = 20 * 60
 
@@ -62,22 +62,23 @@ def check_password():
         time_elapsed = current_time - st.session_state.get("last_activity", current_time)
         if time_elapsed > SESSION_TIMEOUT_SECONDS:
             st.session_state["authenticated"] = False
+            st.session_state["admin_authenticated"] = False
             st.warning("⏱️ Votre session a expiré après 20 minutes d'inactivité. Veuillez vous reconnecter.")
             return False
         st.session_state["last_activity"] = current_time
         return True
 
-    # 2. Écran de connexion
+    # 2. Écran de connexion principal
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown('<div class="main-header" style="text-align: center;"><h2>🔒 Accès Sécurisé</h2><span>Suivi Énergétique du Parc Municipal</span></div>', unsafe_allow_html=True)
         expected_pwd = st.secrets.get("APP_PASSWORD")
         if not expected_pwd:
-            st.error("⚠️ Aucun mot de passe (APP_PASSWORD) n'est configuré dans les secrets. Accès bloqué.")
+            st.error("⚠️ Aucun mot de passe (APP_PASSWORD) n'est configuré dans les secrets de l'application. Accès bloqué.")
             st.stop()
             
         with st.form("form_login"):
-            pwd_input = st.text_input("Veuillez saisir le mot de passe :", type="password")
+            pwd_input = st.text_input("Veuillez saisir le mot de passe d'accès :", type="password")
             submit_login = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
             if submit_login:
                 if pwd_input == expected_pwd:
@@ -111,7 +112,7 @@ def display_flash():
             st.info(msg, icon="ℹ️")
 
 # ==============================================================================
-# CONSTANTES ET RÉFÉRENTIELS (INCLUANT EAU FROIDE, ECS & EAU GLACÉE)
+# CONSTANTES ET RÉFÉRENTIELS (TOUS FLUIDES INCLUS)
 # ==============================================================================
 DEFAULT_SECTEURS = [
     "Secteur 1 - Centre / Administratif",
@@ -131,7 +132,6 @@ REFERENTIEL_EPOQUES = {
 
 DELAI_DJU_JOURS = 5
 
-# Dictionnaire des unités autorisées par type de fluide / énergie
 UNITES_PAR_ENERGIE = {
     "Gaz naturel": ["m3", "kWh", "MWh"],
     "Chauffage urbain": ["kWh", "MWh"],
@@ -285,21 +285,13 @@ def get_saison_chauffe(d) -> str:
     else: return f"{d.year - 1}/{d.year}"
 
 def convertir_en_mwh_equivalent(valeur: float, unite: str, type_energie: str = "") -> float:
-    if valeur is None or pd.isna(valeur): 
-        return 0.0
-    
-    # L'eau froide est exclue du cumul MWh énergétique du Dashboard
-    if type_energie == "Eau froide":
-        return 0.0
+    if valeur is None or pd.isna(valeur): return 0.0
+    if type_energie == "Eau froide": return 0.0 # Exclu du cumul énergétique MWh
         
     unite = str(unite).lower().strip()
-    if unite in ['mwh']: 
-        return float(valeur)
-    elif unite in ['m3']: 
-        # Pour le Gaz, l'ECS ou l'Eau glacée comptabilisés en m³ (~10 kWh/m³)
-        return float(valeur) * 0.01
-    elif unite in ['kwh', 'kw']: 
-        return float(valeur) / 1000.0
+    if unite in ['mwh']: return float(valeur)
+    elif unite in ['m3']: return float(valeur) * 0.01
+    elif unite in ['kwh', 'kw']: return float(valeur) / 1000.0
     return float(valeur)
 
 @st.cache_data(ttl=3600, show_spinner="☁️ Récupération de la météo réelle via Open-Meteo...")
@@ -384,6 +376,7 @@ with st.sidebar:
     
     if st.button("🚪 Déconnexion", use_container_width=True):
         st.session_state["authenticated"] = False
+        st.session_state["admin_authenticated"] = False
         st.rerun()
     st.divider()
     menu = st.radio(
@@ -548,7 +541,7 @@ elif menu == "🔥 Efficacité MWh/DJU":
 
 
 # ==============================================================================
-# TAB 4: SAISIE HEBDOMADAIRE (@st.fragment ISOLÉ)
+# TAB 4: SAISIE HEBDOMADAIRE (@st.fragment ISOLÉ AVEC S-1 À DROITE)
 # ==============================================================================
 elif menu == "📝 Saisie Hebdomadaire":
     st.markdown('<div class="main-header"><h2>📝 Saisie des Index par Compteur</h2><span>Relevé rapide sur le terrain</span></div>', unsafe_allow_html=True)
@@ -581,11 +574,17 @@ elif menu == "📝 Saisie Hebdomadaire":
             dict_prev, dict_existants = get_releves_s1_et_actuels(c_ids, dt_d.strftime("%Y-%m-%d"), sem_label)
 
             df_grid = df_c.copy()
-            df_grid['Relevé S-1 (Précédent)'] = df_grid['compteur_id'].map(lambda cid: float(dict_prev.get(cid, 0.0)))
+            # 1. Colonne de saisie active
             df_grid['Consommation'] = df_grid['compteur_id'].map(lambda cid: float(dict_existants.get(cid, 0.0)))
+            # 2. Colonne S-1 verrouillée placée à droite
+            df_grid['Relevé S-1 (Précédent)'] = df_grid['compteur_id'].map(lambda cid: float(dict_prev.get(cid, 0.0)))
 
             edited_grid = st.data_editor(
                 df_grid,
+                column_order=[
+                    "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité", 
+                    "Consommation", "Relevé S-1 (Précédent)"
+                ],
                 column_config={
                     "compteur_id": None, "Ordre": None,
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
@@ -593,8 +592,8 @@ elif menu == "📝 Saisie Hebdomadaire":
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
                     "Énergie": st.column_config.TextColumn(disabled=True),
                     "Unité": st.column_config.TextColumn(disabled=True),
-                    "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1", disabled=True, format="%.1f"),
-                    "Consommation": st.column_config.NumberColumn("Valeur / Index Conso", min_value=0.0, step=0.1)
+                    "Consommation": st.column_config.NumberColumn("Valeur / Index Conso", min_value=0.0, step=0.1),
+                    "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1 (🔒 Verrouillé)", disabled=True, format="%.1f")
                 },
                 hide_index=True, use_container_width=True, num_rows="fixed",
                 key=f"grid_{sem_label}_{hash(c_ids)}"
@@ -642,19 +641,50 @@ elif menu == "📝 Saisie Hebdomadaire":
                     set_flash(f"Les relevés de {count} sous-compteur(s) ont été enregistrés avec succès !", "success")
                     st.rerun()
 
-            df_export = edited_grid[['Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Relevé S-1 (Précédent)', 'Consommation']].copy()
+            df_export = edited_grid[['Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Consommation', 'Relevé S-1 (Précédent)']].copy()
             c_btn2.download_button(label="📥 Exporter cette semaine en Excel", data=generate_excel_bytes(df_export, sheet_name=f"Saisie_{sem_label.split(' ')[0]}"), file_name=f"saisie_compteurs_{sem_label.split(' ')[0]}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
         render_tableau_saisie(df_compteurs, selected_week_label, date_d, date_f, dju_val, dju_fiable_val)
 
 
 # ==============================================================================
-# TAB 5: GESTION ET ADMINISTRATION (8 SOUS-ONGLETS COMPLETS)
+# TAB 5: GESTION ET ADMINISTRATION (VERROUILLÉ PAR CODE ADMIN)
 # ==============================================================================
 elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
-    st.markdown('<div class="main-header"><h2>⚙️ Administration du Parc</h2><span>Gestion des sites, édition des sous-compteurs et réorganisation</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h2>⚙️ Administration du Parc</h2><span>Accès restreint aux administrateurs</span></div>', unsafe_allow_html=True)
     display_flash()
     
+    # --- VÉRIFICATION DU CODE ADMINISTRATEUR ---
+    if "admin_authenticated" not in st.session_state:
+        st.session_state["admin_authenticated"] = False
+
+    if not st.session_state["admin_authenticated"]:
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.warning("🔒 **Espace Réservé**\n\nCet onglet permet de modifier la structure des bâtiments et des sous-compteurs. Seuls les administrateurs autorisés peuvent y accéder.")
+            
+            with st.form("form_admin_lock"):
+                pwd_admin_input = st.text_input("Code Administrateur :", type="password")
+                btn_unlock = st.form_submit_button("🔓 Déverrouiller l'Administration", type="primary", use_container_width=True)
+                
+                if btn_unlock:
+                    expected_admin_pwd = st.secrets.get("ADMIN_PASSWORD", "admin123")
+                    if pwd_admin_input == expected_admin_pwd:
+                        st.session_state["admin_authenticated"] = True
+                        st.success("Accès Administrateur accordé !")
+                        st.rerun()
+                    else:
+                        st.error("🔑 Code Administrateur incorrect.")
+        st.stop()  # Bloque le chargement des 8 sous-onglets tant que l'accès admin n'est pas validé
+
+    # --- BANDEAU SUPERIEUR SI ADMIN DÉVERROUILLÉ ---
+    col_adm1, col_adm2 = st.columns([3, 1])
+    col_adm1.caption("🔓 Vous êtes actuellement connecté en mode **Administrateur**.")
+    if col_adm2.button("🔒 Verrouiller l'admin", type="secondary", use_container_width=True):
+        st.session_state["admin_authenticated"] = False
+        st.rerun()
+
+    # --- LES 8 SOUS-ONGLETS COMPLETS DE GESTION ---
     tab_add_site, tab_edit_site, tab_ordre_sites, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
         "➕ Ajouter Bâtiment", "✏️ Modifier Site", "🔢 Ordre des Bâtiments",
         "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", "🏷️ Renommer Secteurs", 
@@ -774,7 +804,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # 4. AJOUTER SOUS-COMPTEUR (AVEC NOUVEAUX FLUIDES)
+    # 4. AJOUTER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_add_compteur:
         st.subheader("➕ Rattacher un sous-compteur à un bâtiment")
