@@ -575,12 +575,18 @@ elif menu == "📝 Saisie Hebdomadaire":
             df_grid = df_c.copy()
             df_grid['Consommation'] = df_grid['compteur_id'].map(lambda cid: float(dict_existants.get(cid, 0.0)))
             df_grid['Relevé S-1 (Précédent)'] = df_grid['compteur_id'].map(lambda cid: float(dict_prev.get(cid, 0.0)))
+            
+            # --- CALCUL DE L'ÉCART POUR DÉTECTION D'ANOMALIE ---
+            df_grid['Écart S-1'] = df_grid.apply(
+                lambda r: r['Consommation'] - r['Relevé S-1 (Précédent)'] if r['Consommation'] > 0 and r['Relevé S-1 (Précédent)'] > 0 else 0.0,
+                axis=1
+            )
 
             edited_grid = st.data_editor(
                 df_grid,
                 column_order=[
                     "Ordre Excel", "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité", 
-                    "Consommation", "Relevé S-1 (Précédent)"
+                    "Consommation", "Relevé S-1 (Précédent)", "Écart S-1"
                 ],
                 column_config={
                     "compteur_id": None,
@@ -591,11 +597,27 @@ elif menu == "📝 Saisie Hebdomadaire":
                     "Énergie": st.column_config.TextColumn(disabled=True),
                     "Unité": st.column_config.TextColumn(disabled=True),
                     "Consommation": st.column_config.NumberColumn("Valeur / Index Conso", min_value=0.0, step=0.1),
-                    "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1 (🔒 Verrouillé)", disabled=True, format="%.1f")
+                    "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1 (🔒 Verrouillé)", disabled=True, format="%.1f"),
+                    "Écart S-1": st.column_config.NumberColumn("Différence S - (S-1)", disabled=True, format="%.1f")
                 },
                 hide_index=True, use_container_width=True, num_rows="fixed",
                 key=f"grid_{sem_label}_{hash(c_ids)}"
             )
+
+            # --- DÉTECTION ET ALERTE VISUELLE SI INDEX S < INDEX S-1 ---
+            anomalies_incoherentes = edited_grid[
+                (edited_grid['Consommation'] > 0) & 
+                (edited_grid['Relevé S-1 (Précédent)'] > 0) & 
+                (edited_grid['Consommation'] < edited_grid['Relevé S-1 (Précédent)'])
+            ]
+
+            if not anomalies_incoherentes.empty:
+                st.warning("⚠️ **Attention : Incohérence détectée sur les index !**")
+                for _, row_anom in anomalies_incoherentes.iterrows():
+                    st.caption(
+                        f"🔴 **{row_anom['Bâtiment']} ({row_anom['N° Compteur']})** : "
+                        f"Nouvelle valeur ({row_anom['Consommation']:.1f}) < S-1 ({row_anom['Relevé S-1 (Précédent)']:.1f})"
+                    )
 
             c_btn1, c_btn2 = st.columns([2, 1])
             if c_btn1.button("💾 Enregistrer les relevés de cette tournée", type="primary"):
@@ -661,7 +683,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                     set_flash(f"Les relevés de {count} sous-compteur(s) ont été enregistrés avec succès !", "success")
                     st.rerun()
 
-            df_export = edited_grid[['Ordre Excel', 'Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Consommation', 'Relevé S-1 (Précédent)']].copy()
+            df_export = edited_grid[['Ordre Excel', 'Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Consommation', 'Relevé S-1 (Précédent)', 'Écart S-1']].copy()
             c_btn2.download_button(label="📥 Exporter cette semaine en Excel", data=generate_excel_bytes(df_export, sheet_name=f"Saisie_{sem_label.split(' ')[0]}"), file_name=f"saisie_compteurs_{sem_label.split(' ')[0]}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
         render_tableau_saisie(df_compteurs, selected_week_label, date_d, date_f, dju_val, dju_fiable_val)
