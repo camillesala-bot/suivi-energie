@@ -174,7 +174,7 @@ def init_db():
     with engine.begin() as conn:
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS secteurs (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS sites (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL, secteur VARCHAR(255) NOT NULL, surface_m2 FLOAT NOT NULL, epoque VARCHAR(255) NOT NULL, ordre INT DEFAULT 0);"))
-        conn.execute(text(f"CREATE TABLE IF NOT EXISTS compteurs (id {pk_auto}, site_id INT NOT NULL, numero_compteur VARCHAR(255) UNIQUE NOT NULL, type_energie VARCHAR(255) NOT NULL, unite VARCHAR(255) NOT NULL, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS compteurs (id {pk_auto}, site_id INT NOT NULL, numero_compteur VARCHAR(255) UNIQUE NOT NULL, type_energie VARCHAR(255) NOT NULL, unite VARCHAR(255) NOT NULL, ordre INT DEFAULT 0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves (id {pk_auto}, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, date_releve DATE NOT NULL, conso_val FLOAT NOT NULL, dju_reels FLOAT NOT NULL, FOREIGN KEY (compteur_id) REFERENCES compteurs(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves_audit (id {pk_auto}, releve_id INT NOT NULL, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, ancienne_valeur FLOAT NOT NULL, nouvelle_valeur FLOAT NOT NULL, date_modification VARCHAR(255) NOT NULL);"))
 
@@ -190,12 +190,17 @@ def init_db():
             conn.execute(text("ALTER TABLE releves ADD COLUMN IF NOT EXISTS dju_fiable BOOLEAN DEFAULT TRUE"))
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE releves_audit ADD COLUMN IF NOT EXISTS champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE compteurs ADD COLUMN IF NOT EXISTS ordre INT DEFAULT 0"))
     else:
         with engine.begin() as conn:
             try: conn.execute(text("ALTER TABLE releves ADD COLUMN dju_fiable BOOLEAN DEFAULT 1"))
             except Exception: pass
         with engine.begin() as conn:
             try: conn.execute(text("ALTER TABLE releves_audit ADD COLUMN champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
+            except Exception: pass
+        with engine.begin() as conn:
+            try: conn.execute(text("ALTER TABLE compteurs ADD COLUMN ordre INT DEFAULT 0"))
             except Exception: pass
 
     with engine.begin() as conn:
@@ -219,15 +224,439 @@ def get_secteurs_list():
 def get_compteurs_par_secteur(secteur_filtre):
     with engine.connect() as conn:
         query = """
-            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ordre as "Ordre",
+            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ordre as "Ordre Site", c.ordre as "Ordre Compteur",
                    c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
             FROM compteurs c JOIN sites s ON c.site_id = s.id
         """
         if secteur_filtre != "Tous les secteurs":
-            query += " WHERE s.secteur = :sec ORDER BY s.ordre ASC, s.nom ASC, c.numero_compteur ASC"
+            query += " WHERE s.secteur = :sec ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
             return pd.read_sql(text(query), conn, params={"sec": secteur_filtre})
         else:
-            query += " ORDER BY s.ordre ASC, s.nom ASC, c.numero_compteur ASC"
+            query += " ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+            return pd.read_sql(text(query), conn)
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_releves_s1_et_actuels(compteur_ids_tuple, date_d_str, semaine_label):
+    if not compteur_ids_tuple:
+        return {}, {}
+    with engine.connect() as conn:
+        df_prev = pd.read_sql(
+            text("""
+                SELECT r.compteur_id, r.conso_val 
+                FROM releves r
+                WHERE r.date_releve < :d_start
+                AND r.compteur_id IN :ids
+                AND r.id = (
+                    SELECT r2.id FROM releves r2
+                    WHERE r2.compteur_id = r.compteur_id AND r2.date_releve < :d_start
+                    ORDER BY r2.date_releve DESC, r2.id DESC
+                    LIMIT 1
+                )
+            """).bindparams(bindparam("ids", expanding=True)),
+            conn, params={"d_start": date_d_str, "ids": list(compteur_ids_tuple)}
+        )
+        dict_prev = dict(zip(df_prev['compteur_id'], df_prev['conso_val'])) if not df_prev.empty else {}
+
+        df_existants = pd.read_sql(
+            text("SELECT compteur_id, conso_val FROM releves WHERE semaine_label = :sem AND compteur_id IN :ids").bindparams(bindparam("ids", expanding=True)),
+            conn, params={"sem": semaine_label, "ids": list(compteur_ids_tuple)}
+        )
+        dict_existants = dict(zip(df_existants['compteur_id'], df_existants['conso_val'])) if not df_existants.empty else {}
+
+    return dict_prev, dict_existants
+
+# ==============================================================================
+# UTILITAIRES & CONVERSION D'ÉNERGIE
+# ==============================================================================
+def generate_excel_bytes(df: pd.DataFrame, sheet_name="Données") -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
+
+def get_all_weeks_of_year(year: int):
+    weeks = []
+    total_weeks = date(year, 12, 28).isocalendar()[1]
+    for w in range(1, total_weeks + 1):
+        mon = date.fromisocalendar(year, w, 1)
+        sun = date.fromisocalendar(year, w, 7)
+        label = f"S{w:02d} ({mon.strftime('%d/%m')} - {sun.strftime('%d/%m/%Y')})"
+        weeks.append({"label": label, "week_num": w, "mon": mon, "sun": sun})
+    return weeks
+
+MOIS_DEBUT_SAISON = 7
+def get_saison_chauffe(d) -> str:
+    if d.month >= MOIS_DEBUT_SAISON: return f"{d.year}/{d.year + 1}"
+    else: return f"{d.year - 1}/{d.year}"
+
+def convertir_en_mwh_equivalent(valeur: float, unite: str, type_energie: str = "") -> float:
+    if valeur is None or pd.isna(valeur): return 0.0
+    if type_energie == "Eau froide": return 0.0 # Exclu du cumul énergétique MWh
+        
+    unite = str(unite).lower().strip()
+    if unite in ['mwh']: return float(valeur)
+    elif unite in ['m3']: return float(valeur) * 0.01
+    elif unite in ['kwh', 'kw']: return float(valeur) / 1000.0
+    return float(valeur)
+
+@st.cache_data(ttl=3600, show_spinner="☁️ Récupération de la météo réelle via Open-Meteo...")
+def _fetch_dju_hebdo_raw(date_debut_str: str, date_fin_str: str, lat: float, lon: float) -> dict:
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": lat, "longitude": lon,
+        "start_date": date_debut_str, "end_date": date_fin_str,
+        "daily": ["temperature_2m_max", "temperature_2m_min"],
+        "timezone": "Europe/Paris"
+    }
+    last_error = None
+    data = None
+    for attempt in range(3):
+        try:
+            res = requests.get(url, params=params, timeout=8)
+            res.raise_for_status()
+            data = res.json()
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < 2: time.sleep(1.5 * (attempt + 1))
+            
+    if data is None: raise RuntimeError(f"Échec après 3 tentatives : {last_error}")
+    if "daily" not in data or "temperature_2m_max" not in data["daily"]:
+        raise RuntimeError("Réponse Open-Meteo inattendue.")
+    
+    temps_max = data["daily"]["temperature_2m_max"]
+    temps_min = data["daily"]["temperature_2m_min"]
+    dju_total = sum(max(0.0, 18.0 - (t_min + t_max) / 2) for t_max, t_min in zip(temps_max, temps_min) if t_max is not None and t_min is not None)
+    jours_valides = sum(1 for t_max, t_min in zip(temps_max, temps_min) if t_max is not None and t_min is not None)
+    
+    if jours_valides == 0: raise RuntimeError("Aucune donnée météo disponible pour cette période.")
+    return {"dju": round(dju_total, 1), "jours_valides": jours_valides, "jours_total": len(temps_max)}
+
+def fetch_dju_hebdo(date_debut_str: str, date_fin_str: str, lat=45.18, lon=5.73) -> dict:
+    try:
+        result = _fetch_dju_hebdo_raw(date_debut_str, date_fin_str, lat, lon)
+    except Exception as e:
+        return {"dju": 100.0, "fiable": False, "message": f"⚠️ Impossible de récupérer la météo réelle ({e}). Valeur par défaut (100.0) appliquée."}
+    
+    if result["jours_valides"] < result["jours_total"]:
+        manquants = result["jours_total"] - result["jours_valides"]
+        return {"dju": result["dju"], "fiable": False, "message": f"⚠️ Données météo incomplètes ({manquants} jour(s) manquants sur l'API)."}
+    return {"dju": result["dju"], "fiable": True, "message": None}
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def refresh_stale_dju():
+    limite = (date.today() - timedelta(days=DELAI_DJU_JOURS)).strftime("%Y-%m-%d")
+    with engine.connect() as conn:
+        semaines_a_verifier = pd.read_sql(text("""
+            SELECT semaine_label, MIN(date_releve) as date_fin
+            FROM releves WHERE dju_fiable = FALSE AND date_releve <= :limite
+            GROUP BY semaine_label LIMIT 3
+        """), conn, params={"limite": limite})
+    
+    nb_corr = 0
+    for _, row in semaines_a_verifier.iterrows():
+        date_fin = pd.to_datetime(row['date_fin']).date()
+        date_debut = date_fin - timedelta(days=6)
+        res = fetch_dju_hebdo(date_debut.strftime("%Y-%m-%d"), date_fin.strftime("%Y-%m-%d"))
+        if res["fiable"]:
+            with engine.begin() as conn:
+                rows = conn.execute(text("SELECT id, compteur_id, dju_reels FROM releves WHERE semaine_label = :sem AND dju_fiable = FALSE"), {"sem": row['semaine_label']}).fetchall()
+                for r in rows:
+                    if abs(float(r[2]) - res["dju"]) > 1e-9:
+                        conn.execute(text("""
+                            INSERT INTO releves_audit (releve_id, compteur_id, semaine_label, ancienne_valeur, nouvelle_valeur, date_modification, champ_modifie)
+                            VALUES (:rid, :cid, :sem, :old, :new, :dt, 'dju')
+                        """), {"rid": r[0], "cid": r[1], "sem": row['semaine_label'], "old": float(r[2]), "new": res["dju"], "dt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                conn.execute(text("UPDATE releves SET dju_reels = :dju, dju_fiable = TRUE WHERE semaine_label = :sem AND dju_fiable = FALSE"), {"dju": res["dju"], "sem": row['semaine_label']})
+            nb_corr += 1
+    return nb_corr
+
+# ==============================================================================
+# BARRE LATÉRALE ET NAVIGATION
+# ==============================================================================
+with st.sidebar:
+    st.image("https://img.icons8.com/fluency/96/lightning-bolt.png", width=64)
+    st.title("Parc Multi-Compteurs")
+    st.caption("Base de données : Supabase")
+    
+    if st.button("🚪 Déconnexion", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state["admin_authenticated"] = False
+        st.rerun()
+    st.divider()
+    menu = st.radio(
+        "Navigation", 
+        ["📊 Dashboard Global", "📈 Analyse & Courbes par Bâtiment", "🔥 Efficacité MWh/DJU", "📝 Saisie Hebdomadaire", "⚙️ Gestion Sites, Compteurs & Secteurs"],
+        index=3
+    )
+
+LISTE_SECTEURS = get_secteurs_list()
+
+try:
+    nb_dju_corriges = refresh_stale_dju()
+    if nb_dju_corriges > 0:
+        set_flash(f"🛠️ Le DJU de {nb_dju_corriges} semaine(s) a été mis à jour automatiquement.", "info")
+except Exception: pass
+
+
+# ==============================================================================
+# TAB 1: DASHBOARD GLOBAL
+# ==============================================================================
+if menu == "📊 Dashboard Global":
+    st.markdown('<div class="main-header"><h2>📊 Tableau de Bord Multi-Énergies</h2><span>Vue consolidée des bâtiments et sous-compteurs</span></div>', unsafe_allow_html=True)
+    display_flash()
+    
+    with engine.connect() as conn:
+        df_semaines = pd.read_sql(text("SELECT DISTINCT semaine_label, date_releve FROM releves ORDER BY date_releve DESC"), conn)
+    
+    if df_semaines.empty:
+        st.info("👋 Aucun relevé enregistré.")
+    else:
+        semaines_dispo = df_semaines.sort_values('date_releve', ascending=False)['semaine_label'].tolist()
+        semaine_sel = st.selectbox("Sélectionner la semaine d'analyse", semaines_dispo)
+        
+        with engine.connect() as conn:
+            df_semaine = pd.read_sql(text("""
+                SELECT r.*, c.numero_compteur, c.type_energie, c.unite,
+                       s.nom as site_nom, s.secteur, s.surface_m2, s.epoque, s.ordre
+                FROM releves r
+                JOIN compteurs c ON r.compteur_id = c.id
+                JOIN sites s ON c.site_id = s.id
+    import streamlit as st
+import pandas as pd
+import requests
+import contextlib
+import io
+import os
+import time
+from datetime import datetime, timedelta, date
+from sqlalchemy import create_engine, text, bindparam
+
+# ==============================================================================
+# CONFIGURATION PAGE STREAMLIT
+# ==============================================================================
+st.set_page_config(
+    page_title="Gestion Énergétique - Multi-Compteurs",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- INJECTION CSS DESIGN ---
+st.markdown("""
+<style>
+    .stApp { background-color: #f1f5f9; }
+    .kpi-card {
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 18px;
+        border-left: 6px solid #2563eb;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        margin-bottom: 12px;
+    }
+    .kpi-card-danger {
+        border-left: 6px solid #dc2626 !important;
+        background-color: #fef2f2;
+    }
+    .kpi-title { font-size: 0.85rem; color: #64748b; font-weight: 600; text-transform: uppercase; }
+    .kpi-value { font-size: 1.8rem; font-weight: 700; color: #0f172a; margin-top: 4px; }
+    .main-header {
+        background: linear-gradient(90deg, #1e293b 0%, #334155 100%);
+        color: white; padding: 18px 24px;
+        border-radius: 12px; margin-bottom: 24px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# AUTHENTIFICATION GLOBALE (EXPIRATION GLISSANTE 20 MINUTES)
+# ==============================================================================
+SESSION_TIMEOUT_SECONDS = 20 * 60
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+if "last_activity" not in st.session_state:
+    st.session_state["last_activity"] = time.time()
+
+def check_password():
+    current_time = time.time()
+    
+    # 1. Vérification du délai d'inactivité
+    if st.session_state["authenticated"]:
+        time_elapsed = current_time - st.session_state.get("last_activity", current_time)
+        if time_elapsed > SESSION_TIMEOUT_SECONDS:
+            st.session_state["authenticated"] = False
+            st.session_state["admin_authenticated"] = False
+            st.warning("⏱️ Votre session a expiré après 20 minutes d'inactivité. Veuillez vous reconnecter.")
+            return False
+        st.session_state["last_activity"] = current_time
+        return True
+
+    # 2. Écran de connexion principal
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown('<div class="main-header" style="text-align: center;"><h2>🔒 Accès Sécurisé</h2><span>Suivi Énergétique du Parc Municipal</span></div>', unsafe_allow_html=True)
+        expected_pwd = st.secrets.get("APP_PASSWORD")
+        if not expected_pwd:
+            st.error("⚠️ Aucun mot de passe (APP_PASSWORD) n'est configuré dans les secrets de l'application. Accès bloqué.")
+            st.stop()
+            
+        with st.form("form_login"):
+            pwd_input = st.text_input("Veuillez saisir le mot de passe d'accès :", type="password")
+            submit_login = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+            if submit_login:
+                if pwd_input == expected_pwd:
+                    st.session_state["authenticated"] = True
+                    st.session_state["last_activity"] = time.time()
+                    st.rerun()
+                else:
+                    st.error("🔑 Mot de passe incorrect.")
+    return False
+
+if not check_password():
+    st.stop()
+
+# ==============================================================================
+# NOTIFICATIONS FLASH EN SESSION
+# ==============================================================================
+if "flash_msg" not in st.session_state:
+    st.session_state["flash_msg"] = None
+
+def set_flash(msg: str, level: str = "success"):
+    st.session_state["flash_msg"] = (level, msg)
+
+def display_flash():
+    if st.session_state.get("flash_msg"):
+        level, msg = st.session_state.pop("flash_msg")
+        if level == "success":
+            st.success(msg, icon="✅")
+        elif level == "error":
+            st.error(msg, icon="🚨")
+        elif level == "info":
+            st.info(msg, icon="ℹ️")
+
+# ==============================================================================
+# CONSTANTES ET RÉFÉRENTIELS (TOUS FLUIDES INCLUS)
+# ==============================================================================
+DEFAULT_SECTEURS = [
+    "Secteur 1 - Centre / Administratif",
+    "Secteur 2 - Nord / Enseignement",
+    "Secteur 3 - Sud / Écoles & Petite Enfance",
+    "Secteur 4 - Est / Sport & Loisirs",
+    "Secteur 5 - Ouest / Culture & Patrimoine",
+    "Secteur 6 - Technique & Logistique",
+    "Secteur 7 - Social & Santé"
+]
+
+REFERENTIEL_EPOQUES = {
+    "1960-1974 (Avant RT)": 350, "1975-1981 (RT 1974)": 220,
+    "1982-1988 (RT 1982)": 160, "1989-2000 (RT 1988/2000)": 110,
+    "2001-2012 (RT 2005)": 75, "2013-2021 (RT 2012)": 50, "2022+ (RE 2020)": 30
+}
+
+DELAI_DJU_JOURS = 5
+
+UNITES_PAR_ENERGIE = {
+    "Gaz naturel": ["m3", "kWh", "MWh"],
+    "Chauffage urbain": ["kWh", "MWh"],
+    "Électricité": ["kWh", "MWh"],
+    "Eau froide": ["m3"],
+    "ECS": ["m3", "kWh", "MWh"],
+    "Eau glacée": ["kWh", "MWh", "m3"],
+}
+
+LISTE_TYPES_ENERGIE = list(UNITES_PAR_ENERGIE.keys())
+DJU_ANNUEL_REFERENCE = 2010
+
+# ==============================================================================
+# CONNEXION BDD ET INITIALISATION TABLES
+# ==============================================================================
+@st.cache_resource
+def get_db_engine():
+    if "db" in st.secrets and "url" in st.secrets["db"]:
+        db_url = st.secrets["db"]["url"]
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        return create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_size=20,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=1800,
+        )
+    else:
+        return create_engine("sqlite:///parc_energie_multi_compteurs.db")
+
+engine = get_db_engine()
+
+@st.cache_resource
+def init_db():
+    is_postgres = "postgresql" in str(engine.url)
+    pk_auto = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS secteurs (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS sites (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL, secteur VARCHAR(255) NOT NULL, surface_m2 FLOAT NOT NULL, epoque VARCHAR(255) NOT NULL, ordre INT DEFAULT 0);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS compteurs (id {pk_auto}, site_id INT NOT NULL, numero_compteur VARCHAR(255) UNIQUE NOT NULL, type_energie VARCHAR(255) NOT NULL, unite VARCHAR(255) NOT NULL, ordre INT DEFAULT 0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves (id {pk_auto}, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, date_releve DATE NOT NULL, conso_val FLOAT NOT NULL, dju_reels FLOAT NOT NULL, FOREIGN KEY (compteur_id) REFERENCES compteurs(id) ON DELETE CASCADE);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves_audit (id {pk_auto}, releve_id INT NOT NULL, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, ancienne_valeur FLOAT NOT NULL, nouvelle_valeur FLOAT NOT NULL, date_modification VARCHAR(255) NOT NULL);"))
+
+    with engine.begin() as conn:
+        try: conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_releves_compteur_semaine ON releves(compteur_id, semaine_label);"))
+        except Exception: pass
+    with engine.begin() as conn:
+        try: conn.execute(text("CREATE INDEX IF NOT EXISTS idx_releves_compteur_date ON releves(compteur_id, date_releve);"))
+        except Exception: pass
+
+    if is_postgres:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE releves ADD COLUMN IF NOT EXISTS dju_fiable BOOLEAN DEFAULT TRUE"))
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE releves_audit ADD COLUMN IF NOT EXISTS champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE compteurs ADD COLUMN IF NOT EXISTS ordre INT DEFAULT 0"))
+    else:
+        with engine.begin() as conn:
+            try: conn.execute(text("ALTER TABLE releves ADD COLUMN dju_fiable BOOLEAN DEFAULT 1"))
+            except Exception: pass
+        with engine.begin() as conn:
+            try: conn.execute(text("ALTER TABLE releves_audit ADD COLUMN champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
+            except Exception: pass
+        with engine.begin() as conn:
+            try: conn.execute(text("ALTER TABLE compteurs ADD COLUMN ordre INT DEFAULT 0"))
+            except Exception: pass
+
+    with engine.begin() as conn:
+        res = conn.execute(text("SELECT COUNT(*) FROM secteurs")).scalar()
+        if res == 0:
+            for s in DEFAULT_SECTEURS:
+                conn.execute(text("INSERT INTO secteurs (nom) VALUES (:nom) ON CONFLICT DO NOTHING;"), {"nom": s})
+
+init_db()
+
+# ==============================================================================
+# FONCTIONS DE REQUÊTES EN CACHE
+# ==============================================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def get_secteurs_list():
+    with engine.connect() as conn:
+        df = pd.read_sql(text("SELECT nom FROM secteurs ORDER BY id"), conn)
+    return df['nom'].tolist() if not df.empty else DEFAULT_SECTEURS
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_compteurs_par_secteur(secteur_filtre):
+    with engine.connect() as conn:
+        query = """
+            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ordre as "Ordre Site", c.ordre as "Ordre Compteur",
+                   c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
+            FROM compteurs c JOIN sites s ON c.site_id = s.id
+        """
+        if secteur_filtre != "Tous les secteurs":
+            query += " WHERE s.secteur = :sec ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+            return pd.read_sql(text(query), conn, params={"sec": secteur_filtre})
+        else:
+            query += " ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
             return pd.read_sql(text(query), conn)
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -467,7 +896,7 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
         site_info = df_sites[df_sites['id'] == site_id].iloc[0]
         
         with engine.connect() as conn:
-            df_compteurs = pd.read_sql(text("SELECT * FROM compteurs WHERE site_id = :s_id"), conn, params={"s_id": site_id})
+            df_compteurs = pd.read_sql(text("SELECT * FROM compteurs WHERE site_id = :s_id ORDER BY ordre ASC, numero_compteur ASC"), conn, params={"s_id": site_id})
             df_releves = pd.read_sql(text("""
                 SELECT r.semaine_label, r.date_releve, r.conso_val, r.dju_reels, c.numero_compteur, c.type_energie, c.unite
                 FROM releves r JOIN compteurs c ON r.compteur_id = c.id
@@ -586,7 +1015,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                     "Consommation", "Relevé S-1 (Précédent)"
                 ],
                 column_config={
-                    "compteur_id": None, "Ordre": None,
+                    "compteur_id": None, "Ordre Site": None, "Ordre Compteur": None,
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
                     "Secteur": st.column_config.TextColumn(disabled=True),
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
@@ -635,7 +1064,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                 get_compteurs_par_secteur.clear()
 
                 if erreurs:
-                    st.error(f"⚠️ {len(erreurs)} relevé(s) n'ont pas pu être enregistrés :")
+                    st.error(f"⚠️ {len(erreurs)} relevé(s) n'ont pas pou être enregistrés :")
                     for err in erreurs: st.error(err)
                 if count > 0:
                     set_flash(f"Les relevés de {count} sous-compteur(s) ont été enregistrés avec succès !", "success")
@@ -675,7 +1104,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                         st.rerun()
                     else:
                         st.error("🔑 Code Administrateur incorrect.")
-        st.stop()  # Bloque le chargement des 8 sous-onglets tant que l'accès admin n'est pas validé
+        st.stop()  # Bloque le chargement des sous-onglets tant que l'accès admin n'est pas validé
 
     # --- BANDEAU SUPERIEUR SI ADMIN DÉVERROUILLÉ ---
     col_adm1, col_adm2 = st.columns([3, 1])
@@ -684,9 +1113,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         st.session_state["admin_authenticated"] = False
         st.rerun()
 
-    # --- LES 8 SOUS-ONGLETS COMPLETS DE GESTION ---
-    tab_add_site, tab_edit_site, tab_ordre_sites, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
-        "➕ Ajouter Bâtiment", "✏️ Modifier Site", "🔢 Ordre des Bâtiments",
+    # --- LES SOUS-ONGLETS COMPLETS DE GESTION (AVEC ORDRE COMPTEURS) ---
+    tab_add_site, tab_edit_site, tab_ordre_sites, tab_ordre_compteurs, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
+        "➕ Ajouter Bâtiment", "✏️ Modifier Site", "🔢 Ordre des Bâtiments", "🔢 Ordre des Compteurs",
         "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", "🏷️ Renommer Secteurs", 
         "📋 Liste Globale", "🕓 Historique des Modifications"
     ])
@@ -804,7 +1233,53 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # 4. AJOUTER SOUS-COMPTEUR
+    # 4. ORDRE DES COMPTEURS (NOUVEAU SOUS-ONGLET)
+    # --------------------------------------------------------------------------
+    with tab_ordre_compteurs:
+        st.subheader("🔢 Organiser l'ordre d'affichage des Sous-Compteurs")
+        secteur_ordre_compteur = st.selectbox("Filtrer par secteur :", ["Tous les secteurs"] + LISTE_SECTEURS, key="select_sec_ordre_compteurs")
+        
+        with engine.connect() as conn:
+            query = """
+                SELECT c.id, s.nom as "Bâtiment", s.secteur as "Secteur", c.numero_compteur as "N° Compteur",
+                       c.type_energie as "Énergie", c.unite as "Unité", c.ordre as "Ordre d'affichage"
+                FROM compteurs c
+                JOIN sites s ON c.site_id = s.id
+            """
+            if secteur_ordre_compteur != "Tous les secteurs":
+                query += " WHERE s.secteur = :sec ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+                df_ordre_compteurs = pd.read_sql(text(query), conn, params={"sec": secteur_ordre_compteur})
+            else:
+                query += " ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+                df_ordre_compteurs = pd.read_sql(text(query), conn)
+
+        if df_ordre_compteurs.empty:
+            st.info("Aucun sous-compteur à organiser.")
+        else:
+            edited_ordre_compteurs = st.data_editor(
+                df_ordre_compteurs,
+                column_config={
+                    "id": None,
+                    "Bâtiment": st.column_config.TextColumn(disabled=True),
+                    "Secteur": st.column_config.TextColumn(disabled=True),
+                    "N° Compteur": st.column_config.TextColumn(disabled=True),
+                    "Énergie": st.column_config.TextColumn(disabled=True),
+                    "Unité": st.column_config.TextColumn(disabled=True),
+                    "Ordre d'affichage": st.column_config.NumberColumn("Ordre d'affichage", min_value=0, step=1)
+                },
+                hide_index=True, use_container_width=True, key="grid_reordre_compteurs"
+            )
+            if st.button("💾 Enregistrer le nouvel ordre des compteurs", type="primary"):
+                with engine.begin() as conn:
+                    for _, row in edited_ordre_compteurs.iterrows():
+                        conn.execute(text("UPDATE compteurs SET ordre = :o WHERE id = :cid"), {"o": int(row["Ordre d'affichage"]), "cid": int(row['id'])})
+                
+                get_compteurs_par_secteur.clear()
+                set_flash("L'ordre d'affichage des sous-compteurs a été mis à jour !", "success")
+                st.rerun()
+
+    # --------------------------------------------------------------------------
+    # 5. AJOUTER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_add_compteur:
         st.subheader("➕ Rattacher un sous-compteur à un bâtiment")
@@ -825,6 +1300,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     
                     type_e = st.selectbox("Type d'énergie / Fluide", LISTE_TYPES_ENERGIE)
                     unite_c = st.selectbox("Unité de mesure", ["m3", "kWh", "MWh"])
+                    ordre_c = st.number_input("Ordre d'affichage (Position)", min_value=0, value=0)
                     st.caption("ℹ️ 'm³' convient pour le gaz, l'eau froide et l'ECS. Pour l'électricité, le chauffage urbain et l'eau glacée, utilisez kWh ou MWh.")
                     
                     if st.form_submit_button("Ajouter le sous-compteur", type="primary"):
@@ -836,9 +1312,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                             try:
                                 with engine.begin() as conn:
                                     conn.execute(text("""
-                                        INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite)
-                                        VALUES (:sid, :num, :type_e, :unite)
-                                    """), {"sid": site_dict_add[sel_site_label], "num": num_c.strip(), "type_e": type_e, "unite": unite_c})
+                                        INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite, ordre)
+                                        VALUES (:sid, :num, :type_e, :unite, :ordre)
+                                    """), {"sid": site_dict_add[sel_site_label], "num": num_c.strip(), "type_e": type_e, "unite": unite_c, "ordre": int(ordre_c)})
                                 
                                 get_compteurs_par_secteur.clear()
                                 set_flash(f"Le sous-compteur '{num_c.strip()}' ({type_e}) a été ajouté avec succès !", "success")
@@ -847,15 +1323,15 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 st.error("🚨 Ce numéro de sous-compteur existe déjà dans la base.")
 
     # --------------------------------------------------------------------------
-    # 5. MODIFIER / REATTRIBUER / SUPPRIMER SOUS-COMPTEUR
+    # 6. MODIFIER / REATTRIBUER / SUPPRIMER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_edit_compteur:
         st.subheader("✏️ Modifier, Réattribuer ou Supprimer un Sous-Compteur")
         with engine.connect() as conn:
             compteurs_db = pd.read_sql(text("""
-                SELECT c.id, c.site_id, c.numero_compteur, c.type_energie, c.unite, s.nom as site_nom, s.secteur 
+                SELECT c.id, c.site_id, c.numero_compteur, c.type_energie, c.unite, c.ordre, s.nom as site_nom, s.secteur 
                 FROM compteurs c JOIN sites s ON c.site_id = s.id 
-                ORDER BY s.ordre ASC, s.nom ASC, c.numero_compteur ASC
+                ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC
             """), conn).to_dict('records')
             all_sites_db = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
             
@@ -886,6 +1362,8 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     unites_possibles = ["m3", "MWh", "kWh"]
                     nouvelle_unite = st.selectbox("Unité de mesure", unites_possibles, index=unites_possibles.index(c_actuel['unite']) if c_actuel['unite'] in unites_possibles else 0)
                     
+                    nouvel_ordre = st.number_input("Ordre d'affichage", min_value=0, value=int(c_actuel['ordre'] if pd.notna(c_actuel['ordre']) else 0))
+
                     if st.form_submit_button("💾 Enregistrer les modifications", type="primary"):
                         if not nouveau_num.strip():
                             st.error("🚨 Le numéro de sous-compteur ne peut pas être vide.")
@@ -896,9 +1374,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 with engine.begin() as conn:
                                     conn.execute(text("""
                                         UPDATE compteurs 
-                                        SET site_id = :sid, numero_compteur = :num, type_energie = :te, unite = :unite
+                                        SET site_id = :sid, numero_compteur = :num, type_energie = :te, unite = :unite, ordre = :ordre
                                         WHERE id = :cid
-                                    """), {"sid": nouveau_site_id, "num": nouveau_num.strip(), "te": nouveau_type, "unite": nouvelle_unite, "cid": compteur_id_selected})
+                                    """), {"sid": nouveau_site_id, "num": nouveau_num.strip(), "te": nouveau_type, "unite": nouvelle_unite, "ordre": int(nouvel_ordre), "cid": compteur_id_selected})
                                 
                                 get_compteurs_par_secteur.clear()
                                 set_flash(f"Le sous-compteur '{nouveau_num.strip()}' a été mis à jour !", "success")
@@ -917,7 +1395,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 6. RENOMMER LES SECTEURS
+    # 7. RENOMMER LES SECTEURS
     # --------------------------------------------------------------------------
     with tab_secteurs:
         st.subheader("🏷️ Personnaliser et renommer les secteurs")
@@ -951,15 +1429,15 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 7. LISTE GLOBALE DU PARC
+    # 8. LISTE GLOBALE DU PARC
     # --------------------------------------------------------------------------
     with tab_list:
         with engine.connect() as conn:
             df_all = pd.read_sql(text("""
-                SELECT s.ordre as "Ordre", s.nom as "Bâtiment", s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
-                       c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
+                SELECT s.ordre as "Ordre Site", s.nom as "Bâtiment", s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
+                       c.ordre as "Ordre Compteur", c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
                 FROM sites s LEFT JOIN compteurs c ON s.id = c.site_id
-                ORDER BY s.ordre ASC, s.nom ASC
+                ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC
             """), conn)
         col_l1, col_l2 = st.columns([3, 1])
         col_l1.subheader("📋 Répertoire complet du parc municipal")
@@ -967,7 +1445,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         st.dataframe(df_all, hide_index=True, use_container_width=True)
 
     # --------------------------------------------------------------------------
-    # 8. HISTORIQUE DES MODIFICATIONS (AUDIT TRAIL)
+    # 9. HISTORIQUE DES MODIFICATIONS (AUDIT TRAIL)
     # --------------------------------------------------------------------------
     with tab_historique:
         st.subheader("🕓 Historique des corrections de relevés")
