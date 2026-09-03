@@ -611,21 +611,21 @@ elif menu == "📝 Saisie Hebdomadaire":
                 axis=1
             )
 
-            # 3. Composant d'édition lié au cache de session
+            # 3. Composant d'édition (Ordre Excel, Énergie et Unité masqués de l'affichage)
             edited_grid = st.data_editor(
                 df_grid,
                 column_order=[
-                    "Ordre Excel", "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité", 
+                    "Bâtiment", "Secteur", "N° Compteur", 
                     "Consommation", "Relevé S-1 (Précédent)", "Écart S-1"
                 ],
                 column_config={
                     "compteur_id": None,
-                    "Ordre Excel": st.column_config.NumberColumn("N° Ligne Excel", disabled=True),
+                    "Ordre Excel": None,  # Masqué
+                    "Énergie": None,      # Masqué
+                    "Unité": None,        # Masqué
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
                     "Secteur": st.column_config.TextColumn(disabled=True),
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
-                    "Énergie": st.column_config.TextColumn(disabled=True),
-                    "Unité": st.column_config.TextColumn(disabled=True),
                     "Consommation": st.column_config.NumberColumn("Valeur / Index Conso", min_value=0.0, step=0.1),
                     "Relevé S-1 (Précédent)": st.column_config.NumberColumn("Relevé S-1 (🔒 Verrouillé)", disabled=True, format="%.1f"),
                     "Écart S-1": st.column_config.NumberColumn("Différence S - (S-1)", disabled=True, format="%.1f")
