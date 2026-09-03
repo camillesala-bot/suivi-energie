@@ -173,7 +173,7 @@ def init_db():
     
     with engine.begin() as conn:
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS secteurs (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL);"))
-        conn.execute(text(f"CREATE TABLE IF NOT EXISTS sites (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL, secteur VARCHAR(255) NOT NULL, surface_m2 FLOAT NOT NULL, epoque VARCHAR(255) NOT NULL, ordre INT DEFAULT 0);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS sites (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL, secteur VARCHAR(255) NOT NULL, surface_m2 FLOAT NOT NULL, epoque VARCHAR(255) NOT NULL);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS compteurs (id {pk_auto}, site_id INT NOT NULL, numero_compteur VARCHAR(255) UNIQUE NOT NULL, type_energie VARCHAR(255) NOT NULL, unite VARCHAR(255) NOT NULL, ordre INT DEFAULT 0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves (id {pk_auto}, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, date_releve DATE NOT NULL, conso_val FLOAT NOT NULL, dju_reels FLOAT NOT NULL, FOREIGN KEY (compteur_id) REFERENCES compteurs(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves_audit (id {pk_auto}, releve_id INT NOT NULL, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, ancienne_valeur FLOAT NOT NULL, nouvelle_valeur FLOAT NOT NULL, date_modification VARCHAR(255) NOT NULL);"))
@@ -224,15 +224,15 @@ def get_secteurs_list():
 def get_compteurs_par_secteur(secteur_filtre):
     with engine.connect() as conn:
         query = """
-            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ordre as "Ordre Site", c.ordre as "Ordre Compteur",
+            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", c.ordre as "Ordre Excel",
                    c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
             FROM compteurs c JOIN sites s ON c.site_id = s.id
         """
         if secteur_filtre != "Tous les secteurs":
-            query += " WHERE s.secteur = :sec ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+            query += " WHERE s.secteur = :sec ORDER BY c.ordre ASC, c.numero_compteur ASC"
             return pd.read_sql(text(query), conn, params={"sec": secteur_filtre})
         else:
-            query += " ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+            query += " ORDER BY c.ordre ASC, c.numero_compteur ASC"
             return pd.read_sql(text(query), conn)
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -412,7 +412,7 @@ if menu == "📊 Dashboard Global":
         with engine.connect() as conn:
             df_semaine = pd.read_sql(text("""
                 SELECT r.*, c.numero_compteur, c.type_energie, c.unite,
-                       s.nom as site_nom, s.secteur, s.surface_m2, s.epoque, s.ordre
+                       s.nom as site_nom, s.secteur, s.surface_m2, s.epoque
                 FROM releves r
                 JOIN compteurs c ON r.compteur_id = c.id
                 JOIN sites s ON c.site_id = s.id
@@ -423,7 +423,7 @@ if menu == "📊 Dashboard Global":
             lambda row: convertir_en_mwh_equivalent(row['conso_val'], row['unite'], row['type_energie']), 
             axis=1
         )
-        df_bat_semaine = df_semaine.groupby(['site_nom', 'secteur', 'surface_m2', 'epoque', 'ordre']).agg({'conso_mwh_eq': 'sum', 'dju_reels': 'mean'}).reset_index().sort_values(by=['ordre', 'site_nom'])
+        df_bat_semaine = df_semaine.groupby(['site_nom', 'secteur', 'surface_m2', 'epoque']).agg({'conso_mwh_eq': 'sum', 'dju_reels': 'mean'}).reset_index().sort_values(by='site_nom')
         df_bat_semaine['ratio_kwh_m2'] = df_bat_semaine.apply(lambda r: (r['conso_mwh_eq'] * 1000) / r['surface_m2'] if r['surface_m2'] > 0 else 0.0, axis=1)
         df_bat_semaine['cible_kwh'] = df_bat_semaine.apply(
             lambda r: (REFERENTIEL_EPOQUES.get(r['epoque'], 200) * (r['dju_reels'] / DJU_ANNUEL_REFERENCE))
@@ -456,7 +456,7 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
     display_flash()
     
     with engine.connect() as conn:
-        df_sites = pd.read_sql(text("SELECT * FROM sites ORDER BY ordre ASC, nom ASC"), conn)
+        df_sites = pd.read_sql(text("SELECT * FROM sites ORDER BY nom ASC"), conn)
     if df_sites.empty:
         st.info("Aucun bâtiment enregistré.")
     else:
@@ -579,11 +579,12 @@ elif menu == "📝 Saisie Hebdomadaire":
             edited_grid = st.data_editor(
                 df_grid,
                 column_order=[
-                    "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité", 
+                    "Ordre Excel", "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité", 
                     "Consommation", "Relevé S-1 (Précédent)"
                 ],
                 column_config={
-                    "compteur_id": None, "Ordre Site": None, "Ordre Compteur": None,
+                    "compteur_id": None,
+                    "Ordre Excel": st.column_config.NumberColumn("N° Ligne Excel", disabled=True),
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
                     "Secteur": st.column_config.TextColumn(disabled=True),
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
@@ -602,7 +603,6 @@ elif menu == "📝 Saisie Hebdomadaire":
                 d_str = dt_f.strftime("%Y-%m-%d")
                 dt_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # --- OPTIMISATION BDD : TRAITEMENT DE MASSE ---
                 items_to_save = []
                 for _, row in edited_grid.iterrows():
                     val = float(row['Consommation'])
@@ -661,7 +661,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                     set_flash(f"Les relevés de {count} sous-compteur(s) ont été enregistrés avec succès !", "success")
                     st.rerun()
 
-            df_export = edited_grid[['Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Consommation', 'Relevé S-1 (Précédent)']].copy()
+            df_export = edited_grid[['Ordre Excel', 'Bâtiment', 'Secteur', 'N° Compteur', 'Énergie', 'Unité', 'Consommation', 'Relevé S-1 (Précédent)']].copy()
             c_btn2.download_button(label="📥 Exporter cette semaine en Excel", data=generate_excel_bytes(df_export, sheet_name=f"Saisie_{sem_label.split(' ')[0]}"), file_name=f"saisie_compteurs_{sem_label.split(' ')[0]}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
         render_tableau_saisie(df_compteurs, selected_week_label, date_d, date_f, dju_val, dju_fiable_val)
@@ -707,14 +707,63 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         st.rerun()
 
     # --- LES SOUS-ONGLETS COMPLETS DE GESTION ---
-    tab_add_site, tab_edit_site, tab_ordre_sites, tab_ordre_compteurs, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
-        "➕ Ajouter Bâtiment", "✏️ Modifier Site", "🔢 Ordre des Bâtiments", "🔢 Ordre des Compteurs",
+    tab_ordre_compteurs, tab_add_site, tab_edit_site, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
+        "🔢 Ordre des Compteurs (Excel)", "➕ Ajouter Bâtiment", "✏️ Modifier Site",
         "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", "🏷️ Renommer Secteurs", 
         "📋 Liste Globale", "🕓 Historique des Modifications"
     ])
     
     # --------------------------------------------------------------------------
-    # 1. AJOUTER BÂTIMENT
+    # 1. ORDRE DES COMPTEURS (EXCEL)
+    # --------------------------------------------------------------------------
+    with tab_ordre_compteurs:
+        st.subheader("🔢 Organiser l'ordre des Compteurs pour Excel")
+        st.caption("💡 Attribue à chaque compteur le numéro de ligne exact de ton fichier Excel pour pouvoir faire tes copier-coller en toute sécurité.")
+        
+        secteur_ordre_compteur = st.selectbox("Filtrer par secteur :", ["Tous les secteurs"] + LISTE_SECTEURS, key="select_sec_ordre_compteurs")
+        
+        with engine.connect() as conn:
+            query = """
+                SELECT c.id, c.ordre as "N° Ligne Excel", c.numero_compteur as "N° Compteur",
+                       s.nom as "Bâtiment", s.secteur as "Secteur", c.type_energie as "Énergie", c.unite as "Unité"
+                FROM compteurs c
+                JOIN sites s ON c.site_id = s.id
+            """
+            if secteur_ordre_compteur != "Tous les secteurs":
+                query += " WHERE s.secteur = :sec ORDER BY c.ordre ASC, c.numero_compteur ASC"
+                df_ordre_compteurs = pd.read_sql(text(query), conn, params={"sec": secteur_ordre_compteur})
+            else:
+                query += " ORDER BY c.ordre ASC, c.numero_compteur ASC"
+                df_ordre_compteurs = pd.read_sql(text(query), conn)
+
+        if df_ordre_compteurs.empty:
+            st.info("Aucun sous-compteur à organiser.")
+        else:
+            edited_ordre_compteurs = st.data_editor(
+                df_ordre_compteurs,
+                column_order=["N° Ligne Excel", "N° Compteur", "Bâtiment", "Secteur", "Énergie", "Unité"],
+                column_config={
+                    "id": None,
+                    "N° Ligne Excel": st.column_config.NumberColumn("N° Ligne Excel", min_value=1, step=1),
+                    "N° Compteur": st.column_config.TextColumn(disabled=True),
+                    "Bâtiment": st.column_config.TextColumn(disabled=True),
+                    "Secteur": st.column_config.TextColumn(disabled=True),
+                    "Énergie": st.column_config.TextColumn(disabled=True),
+                    "Unité": st.column_config.TextColumn(disabled=True)
+                },
+                hide_index=True, use_container_width=True, key="grid_reordre_compteurs"
+            )
+            if st.button("💾 Enregistrer l'ordre Excel des compteurs", type="primary"):
+                update_payload = [{"o": int(row["N° Ligne Excel"]), "cid": int(row['id'])} for _, row in edited_ordre_compteurs.iterrows()]
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE compteurs SET ordre = :o WHERE id = :cid"), update_payload)
+                
+                st.cache_data.clear()
+                set_flash("L'ordre des sous-compteurs a été enregistré !", "success")
+                st.rerun()
+
+    # --------------------------------------------------------------------------
+    # 2. AJOUTER BÂTIMENT
     # --------------------------------------------------------------------------
     with tab_add_site:
         st.subheader("➕ Créer un nouveau bâtiment")
@@ -724,7 +773,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
             secteur_bat = c_s2.selectbox("Secteur", LISTE_SECTEURS)
             surface_bat = c_s1.number_input("Surface chauffée (m²)", min_value=10.0, value=1000.0)
             epoque_bat = c_s2.selectbox("Époque / RT", list(REFERENTIEL_EPOQUES.keys()))
-            ordre_bat = c_s1.number_input("Ordre d'affichage (Position)", min_value=0, value=1)
             
             if st.form_submit_button("Enregistrer le bâtiment", type="primary"):
                 if not nom_bat.strip():
@@ -733,9 +781,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     try:
                         with engine.begin() as conn:
                             conn.execute(text("""
-                                INSERT INTO sites (nom, secteur, surface_m2, epoque, ordre)
-                                VALUES (:nom, :sec, :surf, :epoque, :ordre)
-                            """), {"nom": nom_bat.strip(), "sec": secteur_bat, "surf": float(surface_bat), "epoque": epoque_bat, "ordre": int(ordre_bat)})
+                                INSERT INTO sites (nom, secteur, surface_m2, epoque)
+                                VALUES (:nom, :sec, :surf, :epoque)
+                            """), {"nom": nom_bat.strip(), "sec": secteur_bat, "surf": float(surface_bat), "epoque": epoque_bat})
                         
                         st.cache_data.clear()
                         set_flash(f"Le bâtiment '{nom_bat.strip()}' a été créé avec succès !", "success")
@@ -744,16 +792,16 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                         st.error("🚨 Un bâtiment portant ce nom existe déjà dans la base.")
 
     # --------------------------------------------------------------------------
-    # 2. MODIFIER SITE
+    # 3. MODIFIER SITE
     # --------------------------------------------------------------------------
     with tab_edit_site:
         st.subheader("✏️ Modifier les caractéristiques, renommer ou supprimer un site")
         with engine.connect() as conn:
-            sites_db = pd.read_sql(text("SELECT id, nom, secteur, surface_m2, epoque, ordre FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
+            sites_db = pd.read_sql(text("SELECT id, nom, secteur, surface_m2, epoque FROM sites ORDER BY nom ASC"), conn).to_dict('records')
         if not sites_db:
             st.info("Aucun bâtiment à modifier.")
         else:
-            site_dict_edit = {f"{row['nom']} (Ordre: {row['ordre']})": int(row['id']) for row in sites_db}
+            site_dict_edit = {f"{row['nom']} ({row['secteur']})": int(row['id']) for row in sites_db}
             choix_site_edit = st.selectbox("Sélectionnez le bâtiment à modifier", list(site_dict_edit.keys()), key="select_edit_site_box")
             site_id_selected = site_dict_edit[choix_site_edit]
             
@@ -766,7 +814,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     nouveau_secteur = st.selectbox("Secteur", LISTE_SECTEURS, index=LISTE_SECTEURS.index(site_actuel['secteur']) if site_actuel['secteur'] in LISTE_SECTEURS else 0)
                     nouvelle_surface = st.number_input("Surface chauffée (m²)", min_value=10.0, value=float(site_actuel['surface_m2']))
                     nouvelle_epoque = st.selectbox("Époque / RT", list(REFERENTIEL_EPOQUES.keys()), index=list(REFERENTIEL_EPOQUES.keys()).index(site_actuel['epoque']) if site_actuel['epoque'] in REFERENTIEL_EPOQUES else 0)
-                    nouvel_ordre = st.number_input("Ordre d'affichage", min_value=0, value=int(site_actuel['ordre'] if pd.notna(site_actuel['ordre']) else 0))
                     
                     if st.form_submit_button("💾 Enregistrer les modifications", type="primary"):
                         if not nouveau_nom.strip():
@@ -776,9 +823,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 with engine.begin() as conn:
                                     conn.execute(text("""
                                         UPDATE sites 
-                                        SET nom = :nom, secteur = :sec, surface_m2 = :surf, epoque = :epoque, ordre = :ordre
+                                        SET nom = :nom, secteur = :sec, surface_m2 = :surf, epoque = :epoque
                                         WHERE id = :sid
-                                    """), {"nom": nouveau_nom.strip(), "sec": nouveau_secteur, "surf": float(nouvelle_surface), "epoque": nouvelle_epoque, "ordre": int(nouvel_ordre), "sid": site_id_selected})
+                                    """), {"nom": nouveau_nom.strip(), "sec": nouveau_secteur, "surf": float(nouvelle_surface), "epoque": nouvelle_epoque, "sid": site_id_selected})
                                 
                                 st.cache_data.clear()
                                 set_flash(f"Les modifications du bâtiment '{nouveau_nom.strip()}' ont été enregistrées !", "success")
@@ -796,91 +843,12 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 3. ORDRE DES BÂTIMENTS
-    # --------------------------------------------------------------------------
-    with tab_ordre_sites:
-        st.subheader("🔢 Organiser l'ordre d'affichage des Bâtiments")
-        with engine.connect() as conn:
-            df_ordre_sites = pd.read_sql(text("""SELECT id, nom as "Bâtiment", secteur as "Secteur", ordre as "Ordre" FROM sites ORDER BY ordre ASC, nom ASC"""), conn)
-        if df_ordre_sites.empty:
-            st.info("Aucun bâtiment dans la base.")
-        else:
-            edited_ordre_grid = st.data_editor(
-                df_ordre_sites,
-                column_config={
-                    "id": None,
-                    "Bâtiment": st.column_config.TextColumn(disabled=True),
-                    "Secteur": st.column_config.TextColumn(disabled=True),
-                    "Ordre": st.column_config.NumberColumn("Ordre d'affichage", min_value=0, step=1)
-                },
-                hide_index=True, use_container_width=True, key="grid_reordre_sites"
-            )
-            if st.button("💾 Enregistrer le nouvel ordre des bâtiments", type="primary"):
-                update_payload = [{"o": int(row['Ordre']), "sid": int(row['id'])} for _, row in edited_ordre_grid.iterrows()]
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE sites SET ordre = :o WHERE id = :sid"), update_payload)
-                
-                st.cache_data.clear()
-                set_flash("L'ordre d'affichage des bâtiments a été mis à jour !", "success")
-                st.rerun()
-
-    # --------------------------------------------------------------------------
-    # 4. ORDRE DES COMPTEURS (ADAPTÉ POUR COPIER-COLLER EXCEL)
-    # --------------------------------------------------------------------------
-    with tab_ordre_compteurs:
-        st.subheader("🔢 Organiser l'ordre des Compteurs pour l'export Excel")
-        st.caption("💡 Astuce : Attribue ici à chaque compteur le numéro de ligne correspondant à ton fichier Excel récepteur.")
-        
-        secteur_ordre_compteur = st.selectbox("Filtrer par secteur :", ["Tous les secteurs"] + LISTE_SECTEURS, key="select_sec_ordre_compteurs")
-        
-        with engine.connect() as conn:
-            query = """
-                SELECT c.id, c.ordre as "Position Excel", s.nom as "Bâtiment", s.secteur as "Secteur", 
-                       c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
-                FROM compteurs c
-                JOIN sites s ON c.site_id = s.id
-            """
-            if secteur_ordre_compteur != "Tous les secteurs":
-                query += " WHERE s.secteur = :sec ORDER BY c.ordre ASC, s.nom ASC, c.numero_compteur ASC"
-                df_ordre_compteurs = pd.read_sql(text(query), conn, params={"sec": secteur_ordre_compteur})
-            else:
-                query += " ORDER BY c.ordre ASC, s.nom ASC, c.numero_compteur ASC"
-                df_ordre_compteurs = pd.read_sql(text(query), conn)
-
-        if df_ordre_compteurs.empty:
-            st.info("Aucun sous-compteur à organiser.")
-        else:
-            edited_ordre_compteurs = st.data_editor(
-                df_ordre_compteurs,
-                column_order=["Position Excel", "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité"],
-                column_config={
-                    "id": None,
-                    "Position Excel": st.column_config.NumberColumn("N° Ligne Excel", min_value=1, step=1, help="Numéro de ligne exact de ton fichier Excel"),
-                    "Bâtiment": st.column_config.TextColumn(disabled=True),
-                    "Secteur": st.column_config.TextColumn(disabled=True),
-                    "N° Compteur": st.column_config.TextColumn(disabled=True),
-                    "Énergie": st.column_config.TextColumn(disabled=True),
-                    "Unité": st.column_config.TextColumn(disabled=True)
-                },
-                hide_index=True, use_container_width=True, key="grid_reordre_compteurs"
-            )
-            
-            if st.button("💾 Enregistrer l'ordre pour copier-coller", type="primary"):
-                update_payload = [{"o": int(row["Position Excel"]), "cid": int(row['id'])} for _, row in edited_ordre_compteurs.iterrows()]
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE compteurs SET ordre = :o WHERE id = :cid"), update_payload)
-                
-                st.cache_data.clear()
-                set_flash("L'ordre des compteurs a été enregistré ! Le tableau de saisie suivra cet ordre exact.", "success")
-                st.rerun()
-
-    # --------------------------------------------------------------------------
-    # 5. AJOUTER SOUS-COMPTEUR
+    # 4. AJOUTER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_add_compteur:
         st.subheader("➕ Rattacher un sous-compteur à un bâtiment")
         with engine.connect() as conn:
-            sites_for_compteurs = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
+            sites_for_compteurs = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY nom ASC"), conn).to_dict('records')
         if not sites_for_compteurs:
             st.info("Aucun bâtiment disponible. Créez d'abord un bâtiment.")
         else:
@@ -896,8 +864,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     
                     type_e = st.selectbox("Type d'énergie / Fluide", LISTE_TYPES_ENERGIE)
                     unite_c = st.selectbox("Unité de mesure", ["m3", "kWh", "MWh"])
-                    ordre_c = st.number_input("Ordre d'affichage (Position)", min_value=0, value=0)
-                    st.caption("ℹ️ 'm³' convient pour le gaz, l'eau froide et l'ECS. Pour l'électricité, le chauffage urbain et l'eau glacée, utilisez kWh ou MWh.")
+                    ordre_c = st.number_input("Position / N° Ligne Excel", min_value=1, value=1)
                     
                     if st.form_submit_button("Ajouter le sous-compteur", type="primary"):
                         if not num_c.strip():
@@ -919,7 +886,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 st.error("🚨 Ce numéro de sous-compteur existe déjà dans la base.")
 
     # --------------------------------------------------------------------------
-    # 6. MODIFIER / REATTRIBUER / SUPPRIMER SOUS-COMPTEUR
+    # 5. MODIFIER / REATTRIBUER / SUPPRIMER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_edit_compteur:
         st.subheader("✏️ Modifier, Réattribuer ou Supprimer un Sous-Compteur")
@@ -927,9 +894,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
             compteurs_db = pd.read_sql(text("""
                 SELECT c.id, c.site_id, c.numero_compteur, c.type_energie, c.unite, c.ordre, s.nom as site_nom, s.secteur 
                 FROM compteurs c JOIN sites s ON c.site_id = s.id 
-                ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC
+                ORDER BY c.ordre ASC, c.numero_compteur ASC
             """), conn).to_dict('records')
-            all_sites_db = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY ordre ASC, nom ASC"), conn).to_dict('records')
+            all_sites_db = pd.read_sql(text("SELECT id, nom, secteur FROM sites ORDER BY nom ASC"), conn).to_dict('records')
             
         if not compteurs_db:
             st.info("Aucun sous-compteur enregistré.")
@@ -958,7 +925,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     unites_possibles = ["m3", "MWh", "kWh"]
                     nouvelle_unite = st.selectbox("Unité de mesure", unites_possibles, index=unites_possibles.index(c_actuel['unite']) if c_actuel['unite'] in unites_possibles else 0)
                     
-                    nouvel_ordre = st.number_input("Ordre d'affichage", min_value=0, value=int(c_actuel['ordre'] if pd.notna(c_actuel['ordre']) else 0))
+                    nouvel_ordre = st.number_input("Position / N° Ligne Excel", min_value=1, value=int(c_actuel['ordre'] if pd.notna(c_actuel['ordre']) and c_actuel['ordre'] > 0 else 1))
 
                     if st.form_submit_button("💾 Enregistrer les modifications", type="primary"):
                         if not nouveau_num.strip():
@@ -990,7 +957,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 7. RENOMMER LES SECTEURS
+    # 6. RENOMMER LES SECTEURS
     # --------------------------------------------------------------------------
     with tab_secteurs:
         st.subheader("🏷️ Personnaliser et renommer les secteurs")
@@ -1023,15 +990,17 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 8. LISTE GLOBALE DU PARC
+    # 7. LISTE GLOBALE DU PARC
     # --------------------------------------------------------------------------
     with tab_list:
         with engine.connect() as conn:
             df_all = pd.read_sql(text("""
-                SELECT s.ordre as "Ordre Site", s.nom as "Bâtiment", s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
-                       c.ordre as "Ordre Compteur", c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
-                FROM sites s LEFT JOIN compteurs c ON s.id = c.site_id
-                ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC
+                SELECT c.ordre as "N° Ligne Excel", c.numero_compteur as "N° Compteur", s.nom as "Bâtiment", 
+                       s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
+                       c.type_energie as "Énergie", c.unite as "Unité"
+                FROM compteurs c
+                JOIN sites s ON s.id = c.site_id
+                ORDER BY c.ordre ASC, c.numero_compteur ASC
             """), conn)
         col_l1, col_l2 = st.columns([3, 1])
         col_l1.subheader("📋 Répertoire complet du parc municipal")
@@ -1039,7 +1008,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         st.dataframe(df_all, hide_index=True, use_container_width=True)
 
     # --------------------------------------------------------------------------
-    # 9. HISTORIQUE DES MODIFICATIONS (AUDIT TRAIL)
+    # 8. HISTORIQUE DES MODIFICATIONS (AUDIT TRAIL)
     # --------------------------------------------------------------------------
     with tab_historique:
         st.subheader("🕓 Historique des corrections de relevés")
