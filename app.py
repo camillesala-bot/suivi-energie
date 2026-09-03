@@ -573,8 +573,13 @@ elif menu == "📝 Saisie Hebdomadaire":
             dju_result = fetch_dju_hebdo(date_d.strftime("%Y-%m-%d"), date_f.strftime("%Y-%m-%d"))
 
         dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
+        
+        # --- CORRECTION DE L'AFFICHAGE DU MESSAGE ---
         if dju_result["message"]:
-            st.info(dju_result["message"]) if date_f >= today_date else st.warning(dju_result["message"])
+            if date_f >= today_date:
+                st.info(dju_result["message"])
+            else:
+                st.warning(dju_result["message"])
         
         dju_fiable_val = True if abs(dju_val - dju_result["dju"]) > 1e-9 else dju_result["fiable"]
 
@@ -698,7 +703,6 @@ elif menu == "📝 Saisie Hebdomadaire":
             c_btn2.download_button(label="📥 Exporter cette semaine en Excel", data=generate_excel_bytes(df_export, sheet_name=f"Saisie_{sem_label.split(' ')[0]}"), file_name=f"saisie_compteurs_{sem_label.split(' ')[0]}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
         render_tableau_saisie(df_compteurs, selected_week_label, date_d, date_f, dju_val, dju_fiable_val)
-
 
 # ==============================================================================
 # TAB 5: GESTION ET ADMINISTRATION (VERROUILLÉ PAR CODE ADMIN)
