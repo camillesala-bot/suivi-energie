@@ -825,24 +825,26 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # 4. ORDRE DES COMPTEURS
+    # 4. ORDRE DES COMPTEURS (ADAPTÉ POUR COPIER-COLLER EXCEL)
     # --------------------------------------------------------------------------
     with tab_ordre_compteurs:
-        st.subheader("🔢 Organiser l'ordre d'affichage des Sous-Compteurs")
+        st.subheader("🔢 Organiser l'ordre des Compteurs pour l'export Excel")
+        st.caption("💡 Astuce : Attribue ici à chaque compteur le numéro de ligne correspondant à ton fichier Excel récepteur.")
+        
         secteur_ordre_compteur = st.selectbox("Filtrer par secteur :", ["Tous les secteurs"] + LISTE_SECTEURS, key="select_sec_ordre_compteurs")
         
         with engine.connect() as conn:
             query = """
-                SELECT c.id, s.nom as "Bâtiment", s.secteur as "Secteur", c.numero_compteur as "N° Compteur",
-                       c.type_energie as "Énergie", c.unite as "Unité", c.ordre as "Ordre d'affichage"
+                SELECT c.id, c.ordre as "Position Excel", s.nom as "Bâtiment", s.secteur as "Secteur", 
+                       c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
                 FROM compteurs c
                 JOIN sites s ON c.site_id = s.id
             """
             if secteur_ordre_compteur != "Tous les secteurs":
-                query += " WHERE s.secteur = :sec ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+                query += " WHERE s.secteur = :sec ORDER BY c.ordre ASC, s.nom ASC, c.numero_compteur ASC"
                 df_ordre_compteurs = pd.read_sql(text(query), conn, params={"sec": secteur_ordre_compteur})
             else:
-                query += " ORDER BY s.ordre ASC, s.nom ASC, c.ordre ASC, c.numero_compteur ASC"
+                query += " ORDER BY c.ordre ASC, s.nom ASC, c.numero_compteur ASC"
                 df_ordre_compteurs = pd.read_sql(text(query), conn)
 
         if df_ordre_compteurs.empty:
@@ -850,24 +852,26 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         else:
             edited_ordre_compteurs = st.data_editor(
                 df_ordre_compteurs,
+                column_order=["Position Excel", "Bâtiment", "Secteur", "N° Compteur", "Énergie", "Unité"],
                 column_config={
                     "id": None,
+                    "Position Excel": st.column_config.NumberColumn("N° Ligne Excel", min_value=1, step=1, help="Numéro de ligne exact de ton fichier Excel"),
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
                     "Secteur": st.column_config.TextColumn(disabled=True),
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
                     "Énergie": st.column_config.TextColumn(disabled=True),
-                    "Unité": st.column_config.TextColumn(disabled=True),
-                    "Ordre d'affichage": st.column_config.NumberColumn("Ordre d'affichage", min_value=0, step=1)
+                    "Unité": st.column_config.TextColumn(disabled=True)
                 },
                 hide_index=True, use_container_width=True, key="grid_reordre_compteurs"
             )
-            if st.button("💾 Enregistrer le nouvel ordre des compteurs", type="primary"):
-                update_payload = [{"o": int(row["Ordre d'affichage"]), "cid": int(row['id'])} for _, row in edited_ordre_compteurs.iterrows()]
+            
+            if st.button("💾 Enregistrer l'ordre pour copier-coller", type="primary"):
+                update_payload = [{"o": int(row["Position Excel"]), "cid": int(row['id'])} for _, row in edited_ordre_compteurs.iterrows()]
                 with engine.begin() as conn:
                     conn.execute(text("UPDATE compteurs SET ordre = :o WHERE id = :cid"), update_payload)
                 
                 st.cache_data.clear()
-                set_flash("L'ordre d'affichage des sous-compteurs a été mis à jour !", "success")
+                set_flash("L'ordre des compteurs a été enregistré ! Le tableau de saisie suivra cet ordre exact.", "success")
                 st.rerun()
 
     # --------------------------------------------------------------------------
