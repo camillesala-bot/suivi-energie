@@ -562,9 +562,20 @@ elif menu == "📝 Saisie Hebdomadaire":
         selected_week_data = next(w for w in all_weeks if w["label"] == selected_week_label)
         date_d, date_f = selected_week_data["mon"], selected_week_data["sun"]
 
-        dju_result = fetch_dju_hebdo(date_d.strftime("%Y-%m-%d"), date_f.strftime("%Y-%m-%d"))
+        # --- OPTIMISATION DJU : IGNORER L'API SI SEMAINE EN COURS OU FUTURE ---
+        if date_f >= today_date:
+            dju_result = {
+                "dju": 100.0,
+                "fiable": False,
+                "message": "ℹ️ Semaine en cours : les données météo réelles seront récupérées automatiquement la semaine prochaine."
+            }
+        else:
+            dju_result = fetch_dju_hebdo(date_d.strftime("%Y-%m-%d"), date_f.strftime("%Y-%m-%d"))
+
         dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
-        if dju_result["message"]: st.warning(dju_result["message"])
+        if dju_result["message"]:
+            st.info(dju_result["message"]) if date_f >= today_date else st.warning(dju_result["message"])
+        
         dju_fiable_val = True if abs(dju_val - dju_result["dju"]) > 1e-9 else dju_result["fiable"]
 
         @st.fragment
