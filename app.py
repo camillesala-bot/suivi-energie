@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
 import requests
-import contextlib
 import io
-import os
+import re
 import time
 from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine, text, bindparam
@@ -57,7 +56,6 @@ if "last_activity" not in st.session_state:
 def check_password():
     current_time = time.time()
     
-    # 1. Vérification du délai d'inactivité
     if st.session_state["authenticated"]:
         time_elapsed = current_time - st.session_state.get("last_activity", current_time)
         if time_elapsed > SESSION_TIMEOUT_SECONDS:
@@ -68,7 +66,6 @@ def check_password():
         st.session_state["last_activity"] = current_time
         return True
 
-    # 2. Écran de connexion principal
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown('<div class="main-header" style="text-align: center;"><h2>🔒 Accès Sécurisé</h2><span>Suivi Énergétique du Parc Municipal</span></div>', unsafe_allow_html=True)
@@ -112,7 +109,7 @@ def display_flash():
             st.info(msg, icon="ℹ️")
 
 # ==============================================================================
-# CONSTANTES ET RÉFÉRENTIELS (TOUS FLUIDES INCLUS)
+# CONSTANTES ET RÉFÉRENTIELS
 # ==============================================================================
 DEFAULT_SECTEURS = [
     "Secteur 1 - Centre / Administratif",
@@ -128,6 +125,14 @@ REFERENTIEL_EPOQUES = {
     "1960-1974 (Avant RT)": 350, "1975-1981 (RT 1974)": 220,
     "1982-1988 (RT 1982)": 160, "1989-2000 (RT 1988/2000)": 110,
     "2001-2012 (RT 2005)": 75, "2013-2021 (RT 2012)": 50, "2022+ (RE 2020)": 30
+}
+
+MAP_FLUIDES = {
+    "CU": ("Chauffage urbain", "MWh"),
+    "GZ": ("Gaz naturel", "m3"),
+    "EL": ("Électricité", "kWh"),
+    "EF": ("Eau froide", "m3"),
+    "EG": ("Eau glacée", "kWh")
 }
 
 DELAI_DJU_JOURS = 5
@@ -173,7 +178,7 @@ def init_db():
     
     with engine.begin() as conn:
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS secteurs (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL);"))
-        conn.execute(text(f"CREATE TABLE IF NOT EXISTS sites (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL, secteur VARCHAR(255) NOT NULL, surface_m2 FLOAT NOT NULL, epoque VARCHAR(255) NOT NULL);"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS sites (id {pk_auto}, nom VARCHAR(255) UNIQUE NOT NULL, secteur VARCHAR(255) NOT NULL, surface_m2 FLOAT NOT NULL, epoque VARCHAR(255) NOT NULL, ensemble_batiment VARCHAR(255) DEFAULT 'Non regroupé');"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS compteurs (id {pk_auto}, site_id INT NOT NULL, numero_compteur VARCHAR(255) UNIQUE NOT NULL, type_energie VARCHAR(255) NOT NULL, unite VARCHAR(255) NOT NULL, ordre INT DEFAULT 0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves (id {pk_auto}, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, date_releve DATE NOT NULL, conso_val FLOAT NOT NULL, dju_reels FLOAT NOT NULL, FOREIGN KEY (compteur_id) REFERENCES compteurs(id) ON DELETE CASCADE);"))
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS releves_audit (id {pk_auto}, releve_id INT NOT NULL, compteur_id INT NOT NULL, semaine_label VARCHAR(255) NOT NULL, ancienne_valeur FLOAT NOT NULL, nouvelle_valeur FLOAT NOT NULL, date_modification VARCHAR(255) NOT NULL);"))
@@ -192,6 +197,8 @@ def init_db():
             conn.execute(text("ALTER TABLE releves_audit ADD COLUMN IF NOT EXISTS champ_modifie VARCHAR(50) DEFAULT 'consommation'"))
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE compteurs ADD COLUMN IF NOT EXISTS ordre INT DEFAULT 0"))
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE sites ADD COLUMN IF NOT EXISTS ensemble_batiment VARCHAR(255) DEFAULT 'Non regroupé'"))
     else:
         with engine.begin() as conn:
             try: conn.execute(text("ALTER TABLE releves ADD COLUMN dju_fiable BOOLEAN DEFAULT 1"))
@@ -201,6 +208,9 @@ def init_db():
             except Exception: pass
         with engine.begin() as conn:
             try: conn.execute(text("ALTER TABLE compteurs ADD COLUMN ordre INT DEFAULT 0"))
+            except Exception: pass
+        with engine.begin() as conn:
+            try: conn.execute(text("ALTER TABLE sites ADD COLUMN ensemble_batiment VARCHAR(255) DEFAULT 'Non regroupé'"))
             except Exception: pass
 
     with engine.begin() as conn:
@@ -224,7 +234,7 @@ def get_secteurs_list():
 def get_compteurs_par_secteur(secteur_filtre):
     with engine.connect() as conn:
         query = """
-            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", c.ordre as "Ordre Excel",
+            SELECT c.id as compteur_id, s.nom as "Bâtiment", s.secteur as "Secteur", s.ensemble_batiment as "Ensemble", c.ordre as "Ordre Excel",
                    c.numero_compteur as "N° Compteur", c.type_energie as "Énergie", c.unite as "Unité"
             FROM compteurs c JOIN sites s ON c.site_id = s.id
         """
@@ -285,7 +295,7 @@ def get_saison_chauffe(d) -> str:
 
 def convertir_en_mwh_equivalent(valeur: float, unite: str, type_energie: str = "") -> float:
     if valeur is None or pd.isna(valeur): return 0.0
-    if type_energie == "Eau froide": return 0.0 # Exclu du cumul énergétique MWh
+    if type_energie == "Eau froide": return 0.0
         
     unite = str(unite).lower().strip()
     if unite in ['mwh']: return float(valeur)
@@ -412,7 +422,7 @@ if menu == "📊 Dashboard Global":
         with engine.connect() as conn:
             df_semaine = pd.read_sql(text("""
                 SELECT r.*, c.numero_compteur, c.type_energie, c.unite,
-                       s.nom as site_nom, s.secteur, s.surface_m2, s.epoque
+                       s.nom as site_nom, s.secteur, s.surface_m2, s.epoque, s.ensemble_batiment
                 FROM releves r
                 JOIN compteurs c ON r.compteur_id = c.id
                 JOIN sites s ON c.site_id = s.id
@@ -423,7 +433,7 @@ if menu == "📊 Dashboard Global":
             lambda row: convertir_en_mwh_equivalent(row['conso_val'], row['unite'], row['type_energie']), 
             axis=1
         )
-        df_bat_semaine = df_semaine.groupby(['site_nom', 'secteur', 'surface_m2', 'epoque']).agg({'conso_mwh_eq': 'sum', 'dju_reels': 'mean'}).reset_index().sort_values(by='site_nom')
+        df_bat_semaine = df_semaine.groupby(['site_nom', 'secteur', 'ensemble_batiment', 'surface_m2', 'epoque']).agg({'conso_mwh_eq': 'sum', 'dju_reels': 'mean'}).reset_index().sort_values(by='site_nom')
         df_bat_semaine['ratio_kwh_m2'] = df_bat_semaine.apply(lambda r: (r['conso_mwh_eq'] * 1000) / r['surface_m2'] if r['surface_m2'] > 0 else 0.0, axis=1)
         df_bat_semaine['cible_kwh'] = df_bat_semaine.apply(
             lambda r: (REFERENTIEL_EPOQUES.get(r['epoque'], 200) * (r['dju_reels'] / DJU_ANNUEL_REFERENCE))
@@ -441,8 +451,8 @@ if menu == "📊 Dashboard Global":
         st.divider()
         col_t1, col_t2 = st.columns([3, 1])
         col_t1.subheader("📋 Synthèse par Bâtiment")
-        df_export_dash = df_bat_semaine[['site_nom', 'secteur', 'surface_m2', 'conso_mwh_eq', 'ratio_kwh_m2', 'ecart_pct']].rename(
-            columns={'site_nom': 'Bâtiment', 'surface_m2': 'Surface (m²)', 'conso_mwh_eq': 'Conso Équiv. (MWh)', 'ratio_kwh_m2': 'kWh/m²', 'ecart_pct': 'Écart Cible (%)'}
+        df_export_dash = df_bat_semaine[['site_nom', 'secteur', 'ensemble_batiment', 'surface_m2', 'conso_mwh_eq', 'ratio_kwh_m2', 'ecart_pct']].rename(
+            columns={'site_nom': 'Bâtiment', 'ensemble_batiment': 'Ensemble', 'surface_m2': 'Surface (m²)', 'conso_mwh_eq': 'Conso Équiv. (MWh)', 'ratio_kwh_m2': 'kWh/m²', 'ecart_pct': 'Écart Cible (%)'}
         )
         col_t2.download_button(label="📥 Exporter Synthèse Excel", data=generate_excel_bytes(df_export_dash, sheet_name="Synthese_Hebdo"), file_name=f"synthese_{semaine_sel.split(' ')[0]}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.dataframe(df_export_dash, hide_index=True, use_container_width=True)
@@ -452,7 +462,7 @@ if menu == "📊 Dashboard Global":
 # TAB 2: ANALYSE PAR BÂTIMENT ET COURBES
 # ==============================================================================
 elif menu == "📈 Analyse & Courbes par Bâtiment":
-    st.markdown('<div class="main-header"><h2>📈 Analyse Détaillée & Courbes par Bâtiment</h2></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h2>📈 Analyse Détaillée & Courbes de Consommation</h2></div>', unsafe_allow_html=True)
     display_flash()
     
     with engine.connect() as conn:
@@ -460,56 +470,115 @@ elif menu == "📈 Analyse & Courbes par Bâtiment":
     if df_sites.empty:
         st.info("Aucun bâtiment enregistré.")
     else:
-        site_dict = {f"{row['nom']} ({row['secteur']})": int(row['id']) for _, row in df_sites.iterrows()}
-        selected_label = st.selectbox("Sélectionnez un bâtiment", list(site_dict.keys()))
-        site_id = site_dict[selected_label]
-        site_info = df_sites[df_sites['id'] == site_id].iloc[0]
-        
-        with engine.connect() as conn:
-            df_compteurs = pd.read_sql(text("SELECT * FROM compteurs WHERE site_id = :s_id ORDER BY ordre ASC, numero_compteur ASC"), conn, params={"s_id": site_id})
-            df_releves = pd.read_sql(text("""
-                SELECT r.semaine_label, r.date_releve, r.conso_val, r.dju_reels, c.numero_compteur, c.type_energie, c.unite
-                FROM releves r JOIN compteurs c ON r.compteur_id = c.id
-                WHERE c.site_id = :s_id ORDER BY r.date_releve ASC
-            """), conn, params={"s_id": site_id})
-        
-        st.write(f"### 🏢 {site_info['nom']} — Surface : {site_info['surface_m2']} m² ({site_info['epoque']})")
-        if df_compteurs.empty:
-            st.warning("Aucun sous-compteur associé à ce bâtiment.")
-        elif df_releves.empty:
-            st.info("Aucun relevé enregistré pour ce bâtiment.")
-        else:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
+        mode_analyse = st.radio("Mode d'analyse :", ["Vue par Bâtiment Unitaire", "Vue Regroupée par Ensemble de Bâtiments"], horizontal=True)
+
+        if mode_analyse == "Vue par Bâtiment Unitaire":
+            site_dict = {f"{row['nom']} ({row['secteur']})": int(row['id']) for _, row in df_sites.iterrows()}
+            selected_label = st.selectbox("Sélectionnez un bâtiment", list(site_dict.keys()))
+            site_id = site_dict[selected_label]
+            site_info = df_sites[df_sites['id'] == site_id].iloc[0]
             
-            df_releves['conso_mwh_eq'] = df_releves.apply(
-                lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite'], r['type_energie']), 
-                axis=1
-            )
-            semaines_ord = df_releves.sort_values('date_releve')['semaine_label'].unique()
-            pivot_compteurs = df_releves.pivot_table(index='semaine_label', columns='numero_compteur', values='conso_mwh_eq', aggfunc='sum').reindex(semaines_ord).fillna(0)
-            pivot_compteurs['Consommation Globale (MWh eq)'] = df_releves.groupby('semaine_label')['conso_mwh_eq'].sum().reindex(semaines_ord)
-            df_dju = df_releves.groupby('semaine_label')['dju_reels'].mean().to_frame()
+            with engine.connect() as conn:
+                df_compteurs = pd.read_sql(text("SELECT * FROM compteurs WHERE site_id = :s_id ORDER BY ordre ASC, numero_compteur ASC"), conn, params={"s_id": site_id})
+                df_releves = pd.read_sql(text("""
+                    SELECT r.semaine_label, r.date_releve, r.conso_val, r.dju_reels, c.numero_compteur, c.type_energie, c.unite
+                    FROM releves r JOIN compteurs c ON r.compteur_id = c.id
+                    WHERE c.site_id = :s_id ORDER BY r.date_releve ASC
+                """), conn, params={"s_id": site_id})
             
-            col_opt1, col_opt2 = st.columns([3, 1])
-            courbes_sel = col_opt1.multiselect("Courbes de consommation :", options=list(pivot_compteurs.columns), default=list(pivot_compteurs.columns))
-            afficher_dju = col_opt2.checkbox("Afficher DJU réels", value=True)
+            st.write(f"### 🏢 {site_info['nom']} — Surface : {site_info['surface_m2']} m² ({site_info['epoque']}) — Ensemble : {site_info.get('ensemble_batiment', 'Non renseigné')}")
             
-            if courbes_sel:
-                fig = make_subplots(specs=[[{"secondary_y": True}]])
-                for col in courbes_sel:
-                    fig.add_trace(go.Scatter(x=pivot_compteurs.index, y=pivot_compteurs[col], name=col, mode='lines+markers', hovertemplate="%{y:.2f} MWh<extra></extra>"), secondary_y=False)
-                if afficher_dju:
-                    fig.add_trace(go.Scatter(x=pivot_compteurs.index, y=df_dju.reindex(pivot_compteurs.index)['dju_reels'], name="DJU Réels", mode='lines', line=dict(color='#f59e0b', width=2.5, dash='dash'), hovertemplate="%{y:.1f} DJU<extra></extra>"), secondary_y=True)
+            if df_compteurs.empty:
+                st.warning("Aucun sous-compteur associé à ce bâtiment.")
+            elif df_releves.empty:
+                st.info("Aucun relevé enregistré pour ce bâtiment.")
+            else:
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
                 
-                fig.update_layout(title_text=f"Analyse croisée Consommation / DJU — {site_info['nom']}", hovermode="x unified", margin=dict(l=20, r=20, t=50, b=20))
-                fig.update_yaxes(title_text="<b>Consommation</b> (MWh eq)", secondary_y=False)
-                fig.update_yaxes(title_text="<b>Rigueur Météo</b> (DJU réels)", secondary_y=True)
-                st.plotly_chart(fig, use_container_width=True)
+                df_releves['conso_mwh_eq'] = df_releves.apply(
+                    lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite'], r['type_energie']), 
+                    axis=1
+                )
+                semaines_ord = df_releves.sort_values('date_releve')['semaine_label'].unique()
+                pivot_compteurs = df_releves.pivot_table(index='semaine_label', columns='numero_compteur', values='conso_mwh_eq', aggfunc='sum').reindex(semaines_ord).fillna(0)
+                pivot_compteurs['Consommation Globale (MWh eq)'] = df_releves.groupby('semaine_label')['conso_mwh_eq'].sum().reindex(semaines_ord)
+                df_dju = df_releves.groupby('semaine_label')['dju_reels'].mean().to_frame()
+                
+                col_opt1, col_opt2 = st.columns([3, 1])
+                courbes_sel = col_opt1.multiselect("Courbes de consommation :", options=list(pivot_compteurs.columns), default=list(pivot_compteurs.columns))
+                afficher_dju = col_opt2.checkbox("Afficher DJU réels", value=True)
+                
+                if courbes_sel:
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    for col in courbes_sel:
+                        fig.add_trace(go.Scatter(x=pivot_compteurs.index, y=pivot_compteurs[col], name=col, mode='lines+markers', hovertemplate="%{y:.2f} MWh<extra></extra>"), secondary_y=False)
+                    if afficher_dju:
+                        fig.add_trace(go.Scatter(x=pivot_compteurs.index, y=df_dju.reindex(pivot_compteurs.index)['dju_reels'], name="DJU Réels", mode='lines', line=dict(color='#f59e0b', width=2.5, dash='dash'), hovertemplate="%{y:.1f} DJU<extra></extra>"), secondary_y=True)
+                    
+                    fig.update_layout(title_text=f"Analyse croisée Consommation / DJU — {site_info['nom']}", hovermode="x unified", margin=dict(l=20, r=20, t=50, b=20))
+                    fig.update_yaxes(title_text="<b>Consommation</b> (MWh eq)", secondary_y=False)
+                    fig.update_yaxes(title_text="<b>Rigueur Météo</b> (DJU réels)", secondary_y=True)
+                    st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            ensembles_dispo = [ens for ens in df_sites['ensemble_batiment'].unique() if pd.notna(ens) and ens.strip() != ""]
+            if not ensembles_dispo:
+                st.info("Aucun ensemble de bâtiments configuré. Attribuez un nom d'ensemble aux bâtiments dans l'onglet Administration.")
+            else:
+                ensemble_sel = st.selectbox("Sélectionnez l'ensemble de bâtiments :", ensembles_dispo)
+                sites_du_groupe = df_sites[df_sites['ensemble_batiment'] == ensemble_sel]
+                site_ids = sites_du_groupe['id'].tolist()
+                surface_totale = sites_du_groupe['surface_m2'].sum()
+                
+                st.write(f"### 🏫 Ensemble : {ensemble_sel} — Bâtiments inclus : {len(sites_du_groupe)} | Surface globale : {surface_totale:.0f} m²")
+                st.caption(f"Composition : {', '.join(sites_du_groupe['nom'].tolist())}")
+
+                with engine.connect() as conn:
+                    df_releves_groupe = pd.read_sql(text("""
+                        SELECT r.semaine_label, r.date_releve, r.conso_val, r.dju_reels, c.numero_compteur, c.type_energie, c.unite, s.nom as site_nom
+                        FROM releves r 
+                        JOIN compteurs c ON r.compteur_id = c.id
+                        JOIN sites s ON c.site_id = s.id
+                        WHERE s.id IN :s_ids ORDER BY r.date_releve ASC
+                    """).bindparams(bindparam("s_ids", expanding=True)), conn, params={"s_ids": site_ids})
+
+                if df_releves_groupe.empty:
+                    st.info("Aucun relevé enregistré pour cet ensemble de bâtiments.")
+                else:
+                    import plotly.graph_objects as go
+                    from plotly.subplots import make_subplots
+
+                    df_releves_groupe['conso_mwh_eq'] = df_releves_groupe.apply(
+                        lambda r: convertir_en_mwh_equivalent(r['conso_val'], r['unite'], r['type_energie']), 
+                        axis=1
+                    )
+                    semaines_ord = df_releves_groupe.sort_values('date_releve')['semaine_label'].unique()
+                    
+                    pivot_batiments = df_releves_groupe.pivot_table(index='semaine_label', columns='site_nom', values='conso_mwh_eq', aggfunc='sum').reindex(semaines_ord).fillna(0)
+                    pivot_batiments['CUMUL ENSEMBLE (MWh eq)'] = df_releves_groupe.groupby('semaine_label')['conso_mwh_eq'].sum().reindex(semaines_ord)
+                    df_dju = df_releves_groupe.groupby('semaine_label')['dju_reels'].mean().to_frame()
+
+                    col_opt1, col_opt2 = st.columns([3, 1])
+                    courbes_sel = col_opt1.multiselect("Courbes à afficher :", options=list(pivot_batiments.columns), default=list(pivot_batiments.columns))
+                    afficher_dju = col_opt2.checkbox("Afficher DJU réels", value=True)
+
+                    if courbes_sel:
+                        fig = make_subplots(specs=[[{"secondary_y": True}]])
+                        for col in courbes_sel:
+                            width = 3.5 if col == 'CUMUL ENSEMBLE (MWh eq)' else 1.5
+                            fig.add_trace(go.Scatter(x=pivot_batiments.index, y=pivot_batiments[col], name=col, mode='lines+markers', line=dict(width=width), hovertemplate="%{y:.2f} MWh<extra></extra>"), secondary_y=False)
+                        if afficher_dju:
+                            fig.add_trace(go.Scatter(x=pivot_batiments.index, y=df_dju.reindex(pivot_batiments.index)['dju_reels'], name="DJU Réels", mode='lines', line=dict(color='#f59e0b', width=2.5, dash='dash'), hovertemplate="%{y:.1f} DJU<extra></extra>"), secondary_y=True)
+                        
+                        fig.update_layout(title_text=f"Analyse Consommation Cumulée — {ensemble_sel}", hovermode="x unified", margin=dict(l=20, r=20, t=50, b=20))
+                        fig.update_yaxes(title_text="<b>Consommation</b> (MWh eq)", secondary_y=False)
+                        fig.update_yaxes(title_text="<b>Rigueur Météo</b> (DJU réels)", secondary_y=True)
+                        st.plotly_chart(fig, use_container_width=True)
 
 
 # ==============================================================================
-# TAB 3: EFFICACITÉ MWh/DJU (CHAUFFAGE GAZ + URBAIN)
+# TAB 3: EFFICACITÉ MWh/DJU
 # ==============================================================================
 elif menu == "🔥 Efficacité MWh/DJU":
     st.markdown('<div class="main-header"><h2>🔥 Efficacité par DJU</h2><span>Chauffage (Gaz + Urbain) ramené à la rigueur climatique</span></div>', unsafe_allow_html=True)
@@ -537,6 +606,8 @@ elif menu == "🔥 Efficacité MWh/DJU":
         st.subheader("📊 Consommation par DJU, saison par saison")
         st.bar_chart(df_ratio["MWh/DJU"])
         st.dataframe(df_ratio.reset_index().rename(columns={"index": "Saison"}), hide_index=True, use_container_width=True)
+
+
 # ==============================================================================
 # TAB 4: SAISIE HEBDOMADAIRE (@st.fragment ISOLÉ AVEC S-1 À DROITE)
 # ==============================================================================
@@ -586,7 +657,6 @@ elif menu == "📝 Saisie Hebdomadaire":
             c_ids = tuple(df_c['compteur_id'].tolist())
             dict_prev, dict_existants = get_releves_s1_et_actuels(c_ids, dt_d.strftime("%Y-%m-%d"), sem_label)
 
-            # Clé unique stable pour maintenir l'état de la grille sans effacement
             editor_key = f"grid_{sem_label}_{hash(c_ids)}"
 
             df_grid = df_c.copy()
@@ -601,7 +671,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                 axis=1
             )
 
-            # 2. Éditeur de données Streamlit avec colonnes masquées
+            # 2. Éditeur de données Streamlit (colonnes secondaires masquées)
             edited_grid = st.data_editor(
                 df_grid,
                 column_order=[
@@ -610,9 +680,10 @@ elif menu == "📝 Saisie Hebdomadaire":
                 ],
                 column_config={
                     "compteur_id": None,
-                    "Ordre Excel": None,  # Masqué
-                    "Énergie": None,      # Masqué
-                    "Unité": None,        # Masqué
+                    "Ordre Excel": None,
+                    "Énergie": None,
+                    "Unité": None,
+                    "Ensemble": None,
                     "Bâtiment": st.column_config.TextColumn(disabled=True),
                     "Secteur": st.column_config.TextColumn(disabled=True),
                     "N° Compteur": st.column_config.TextColumn(disabled=True),
@@ -716,7 +787,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     st.markdown('<div class="main-header"><h2>⚙️ Administration du Parc</h2><span>Accès restreint aux administrateurs</span></div>', unsafe_allow_html=True)
     display_flash()
     
-    # --- VÉRIFICATION DU CODE ADMINISTRATEUR ---
     if "admin_authenticated" not in st.session_state:
         st.session_state["admin_authenticated"] = False
 
@@ -741,22 +811,145 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                         st.error("🔑 Code Administrateur incorrect.")
         st.stop()
 
-    # --- BANDEAU SUPERIEUR SI ADMIN DÉVERROUILLÉ ---
     col_adm1, col_adm2 = st.columns([3, 1])
     col_adm1.caption("🔓 Vous êtes actuellement connecté en mode **Administrateur**.")
     if col_adm2.button("🔒 Verrouiller l'admin", type="secondary", use_container_width=True):
         st.session_state["admin_authenticated"] = False
         st.rerun()
 
-    # --- LES SOUS-ONGLETS COMPLETS DE GESTION ---
-    tab_ordre_compteurs, tab_add_site, tab_edit_site, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
-        "🔢 Ordre des Compteurs (Excel)", "➕ Ajouter Bâtiment", "✏️ Modifier Site",
-        "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", "🏷️ Renommer Secteurs", 
-        "📋 Liste Globale", "🕓 Historique des Modifications"
+    # --- SOUS-ONGLETS D'ADMINISTRATION COMPLETS ---
+    tab_import_secteur, tab_ordre_compteurs, tab_add_site, tab_edit_site, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
+        "📥 Importer par Secteur", "🔢 Ordre des Compteurs (Excel)", "➕ Ajouter Bâtiment", 
+        "✏️ Modifier Site", "➕ Ajouter Sous-Compteur", "✏️ Modifier Sous-Compteur", 
+        "🏷️ Renommer Secteurs", "📋 Liste Globale", "🕓 Historique des Modifications"
     ])
     
     # --------------------------------------------------------------------------
-    # 1. ORDRE DES COMPTEURS (EXCEL)
+    # 1. IMPORTATION MASSIVE PAR SECTEUR / TOURNÉE
+    # --------------------------------------------------------------------------
+    with tab_import_secteur:
+        st.subheader("📥 Importer une Fiche de Remplissage Excel par Secteur")
+        st.caption("Charge le fichier Excel d'une tournée : les bâtiments et sous-compteurs seront créés/mis à jour dans l'ordre exact du fichier.")
+
+        secteur_cible = st.selectbox("📌 Sélectionner le secteur / la tournée concernée :", LISTE_SECTEURS, key="select_secteur_import_excel")
+        uploaded_file = st.file_uploader("Sélectionner le fichier Excel de ce secteur (.xlsx)", type=["xlsx"], key="uploader_secteur_excel")
+
+        if uploaded_file is not None:
+            try:
+                # Lecture brute sans en-tête pour repérer le début du tableau
+                df_raw = pd.read_excel(uploaded_file, header=None)
+                
+                start_row = None
+                for idx, row in df_raw.iterrows():
+                    if row.astype(str).str.contains("Nom du compteur", case=False).any():
+                        start_row = idx
+                        break
+
+                if start_row is None:
+                    st.error("🚨 Impossible de trouver l'en-tête 'Nom du compteur' dans le fichier Excel.")
+                else:
+                    df_data = pd.read_excel(uploaded_file, skiprows=start_row)
+                    df_data.columns = [str(c).strip() for c in df_data.columns]
+                    
+                    col_code = df_data.columns[0]   # Code compteur (ex: 1.CU.126)
+                    col_bat = df_data.columns[1]    # Nom du bâtiment (ex: EAJE NEW YORK)
+                    col_unite = df_data.columns[2]  # Unité (MWh, m3, kWh)
+
+                    # Nettoyage des lignes vides ou inutiles
+                    df_clean = df_data.dropna(subset=[col_code, col_bat]).copy()
+                    df_clean = df_clean[~df_clean[col_code].astype(str).str.contains("Nom du compteur", case=False)]
+
+                    st.write(f"👀 **Aperçu des {len(df_clean)} sous-compteurs détectés pour le `{secteur_cible}` :**")
+                    st.dataframe(df_clean[[col_code, col_bat, col_unite]].head(10), use_container_width=True)
+
+                    if st.button(f"🚀 Importer ces compteurs dans {secteur_cible}", type="primary"):
+                        count_sites = 0
+                        count_compteurs = 0
+                        
+                        with engine.begin() as conn:
+                            # Traitement séquentiel ligne par ligne
+                            for ordre_seq, (_, row) in enumerate(df_clean.iterrows(), start=1):
+                                code_brut = str(row[col_code]).strip()
+                                bat_nom = str(row[col_bat]).strip()
+                                unite_excel = str(row[col_unite]).strip() if pd.notna(row[col_unite]) else ""
+
+                                # Détection du type d'énergie via le code (CU, GZ, EL, EF, EG)
+                                code_fluide = ""
+                                match = re.search(r"\.([A-Z]+)\.", code_brut)
+                                if match:
+                                    code_fluide = match.group(1)
+                                
+                                type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
+                                unite_finale = unite_excel if unite_excel else unite_defaut
+
+                                # A. Insertion ou récupération du Bâtiment
+                                site_id = conn.execute(
+                                    text("SELECT id FROM sites WHERE nom = :nom"),
+                                    {"nom": bat_nom}
+                                ).scalar()
+
+                                if not site_id:
+                                    site_id = conn.execute(
+                                        text("""
+                                            INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
+                                            VALUES (:nom, :sec, 1000.0, '2001-2012 (RT 2005)', 'Non regroupé')
+                                            RETURNING id
+                                        """),
+                                        {"nom": bat_nom, "sec": secteur_cible}
+                                    ).scalar()
+                                    count_sites += 1
+                                else:
+                                    conn.execute(
+                                        text("UPDATE sites SET secteur = :sec WHERE id = :sid"),
+                                        {"sec": secteur_cible, "sid": site_id}
+                                    )
+
+                                # B. Insertion ou Mise à jour du Sous-Compteur
+                                c_exists = conn.execute(
+                                    text("SELECT COUNT(*) FROM compteurs WHERE numero_compteur = :num"),
+                                    {"num": code_brut}
+                                ).scalar()
+
+                                if c_exists == 0:
+                                    conn.execute(
+                                        text("""
+                                            INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite, ordre)
+                                            VALUES (:sid, :num, :type_e, :unite, :ordre)
+                                        """),
+                                        {
+                                            "sid": site_id,
+                                            "num": code_brut,
+                                            "type_e": type_energie,
+                                            "unite": unite_finale,
+                                            "ordre": ordre_seq
+                                        }
+                                    )
+                                    count_compteurs += 1
+                                else:
+                                    conn.execute(
+                                        text("""
+                                            UPDATE compteurs 
+                                            SET site_id = :sid, type_energie = :type_e, unite = :unite, ordre = :ordre
+                                            WHERE numero_compteur = :num
+                                        """),
+                                        {
+                                            "sid": site_id,
+                                            "type_e": type_energie,
+                                            "unite": unite_finale,
+                                            "ordre": ordre_seq,
+                                            "num": code_brut
+                                        }
+                                    )
+
+                        st.cache_data.clear()
+                        set_flash(f"✅ Importation réussie pour {secteur_cible} ! {count_sites} bâtiment(s) créé(s) et {count_compteurs} sous-compteur(s) ordonnés.", "success")
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"🚨 Erreur lors du traitement du fichier : {e}")
+
+    # --------------------------------------------------------------------------
+    # 2. ORDRE DES COMPTEURS (EXCEL)
     # --------------------------------------------------------------------------
     with tab_ordre_compteurs:
         st.subheader("🔢 Organiser l'ordre des Compteurs pour Excel")
@@ -805,16 +998,17 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # 2. AJOUTER BÂTIMENT
+    # 3. AJOUTER BÂTIMENT
     # --------------------------------------------------------------------------
     with tab_add_site:
         st.subheader("➕ Créer un nouveau bâtiment")
         with st.form("form_add_site"):
             c_s1, c_s2 = st.columns(2)
             nom_bat = c_s1.text_input("Nom du Bâtiment")
-            secteur_bat = c_s2.selectbox("Secteur", LISTE_SECTEURS)
-            surface_bat = c_s1.number_input("Surface chauffée (m²)", min_value=10.0, value=1000.0)
-            epoque_bat = c_s2.selectbox("Époque / RT", list(REFERENTIEL_EPOQUES.keys()))
+            ensemble_bat = c_s2.text_input("Ensemble / Groupe de Bâtiments (Ex: Groupe Scolaire, Complexe Sportif)", value="Non regroupé")
+            secteur_bat = c_s1.selectbox("Secteur", LISTE_SECTEURS)
+            surface_bat = c_s2.number_input("Surface chauffée (m²)", min_value=10.0, value=1000.0)
+            epoque_bat = c_s1.selectbox("Époque / RT", list(REFERENTIEL_EPOQUES.keys()))
             
             if st.form_submit_button("Enregistrer le bâtiment", type="primary"):
                 if not nom_bat.strip():
@@ -823,9 +1017,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     try:
                         with engine.begin() as conn:
                             conn.execute(text("""
-                                INSERT INTO sites (nom, secteur, surface_m2, epoque)
-                                VALUES (:nom, :sec, :surf, :epoque)
-                            """), {"nom": nom_bat.strip(), "sec": secteur_bat, "surf": float(surface_bat), "epoque": epoque_bat})
+                                INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
+                                VALUES (:nom, :sec, :surf, :epoque, :ensemble)
+                            """), {"nom": nom_bat.strip(), "sec": secteur_bat, "surf": float(surface_bat), "epoque": epoque_bat, "ensemble": ensemble_bat.strip()})
                         
                         st.cache_data.clear()
                         set_flash(f"Le bâtiment '{nom_bat.strip()}' a été créé avec succès !", "success")
@@ -834,12 +1028,12 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                         st.error("🚨 Un bâtiment portant ce nom existe déjà dans la base.")
 
     # --------------------------------------------------------------------------
-    # 3. MODIFIER SITE
+    # 4. MODIFIER SITE
     # --------------------------------------------------------------------------
     with tab_edit_site:
-        st.subheader("✏️ Modifier les caractéristiques, renommer ou supprimer un site")
+        st.subheader("✏️ Modifier les caractéristiques, l'ensemble ou supprimer un site")
         with engine.connect() as conn:
-            sites_db = pd.read_sql(text("SELECT id, nom, secteur, surface_m2, epoque FROM sites ORDER BY nom ASC"), conn).to_dict('records')
+            sites_db = pd.read_sql(text("SELECT id, nom, secteur, surface_m2, epoque, ensemble_batiment FROM sites ORDER BY nom ASC"), conn).to_dict('records')
         if not sites_db:
             st.info("Aucun bâtiment à modifier.")
         else:
@@ -853,6 +1047,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
             if site_actuel is not None:
                 with st.form(key=f"form_edit_site_{site_id_selected}"):
                     nouveau_nom = st.text_input("Nouveau nom du Bâtiment", value=site_actuel['nom'])
+                    nouveau_ensemble = st.text_input("Ensemble / Groupe de Bâtiments", value=site_actuel['ensemble_batiment'] if pd.notna(site_actuel['ensemble_batiment']) else "Non regroupé")
                     nouveau_secteur = st.selectbox("Secteur", LISTE_SECTEURS, index=LISTE_SECTEURS.index(site_actuel['secteur']) if site_actuel['secteur'] in LISTE_SECTEURS else 0)
                     nouvelle_surface = st.number_input("Surface chauffée (m²)", min_value=10.0, value=float(site_actuel['surface_m2']))
                     nouvelle_epoque = st.selectbox("Époque / RT", list(REFERENTIEL_EPOQUES.keys()), index=list(REFERENTIEL_EPOQUES.keys()).index(site_actuel['epoque']) if site_actuel['epoque'] in REFERENTIEL_EPOQUES else 0)
@@ -865,9 +1060,9 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 with engine.begin() as conn:
                                     conn.execute(text("""
                                         UPDATE sites 
-                                        SET nom = :nom, secteur = :sec, surface_m2 = :surf, epoque = :epoque
+                                        SET nom = :nom, secteur = :sec, surface_m2 = :surf, epoque = :epoque, ensemble_batiment = :ensemble
                                         WHERE id = :sid
-                                    """), {"nom": nouveau_nom.strip(), "sec": nouveau_secteur, "surf": float(nouvelle_surface), "epoque": nouvelle_epoque, "sid": site_id_selected})
+                                    """), {"nom": nouveau_nom.strip(), "sec": nouveau_secteur, "surf": float(nouvelle_surface), "epoque": nouvelle_epoque, "ensemble": nouveau_ensemble.strip(), "sid": site_id_selected})
                                 
                                 st.cache_data.clear()
                                 set_flash(f"Les modifications du bâtiment '{nouveau_nom.strip()}' ont été enregistrées !", "success")
@@ -885,7 +1080,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 4. AJOUTER SOUS-COMPTEUR
+    # 5. AJOUTER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_add_compteur:
         st.subheader("➕ Rattacher un sous-compteur à un bâtiment")
@@ -902,7 +1097,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                 site_dict_add = {f"{s['nom']} ({s['secteur']})": int(s['id']) for s in sites_filtered}
                 with st.form("form_add_subcompteur"):
                     sel_site_label = st.selectbox("Bâtiment concerné", list(site_dict_add.keys()))
-                    num_c = st.text_input("Numéro du sous-compteur (ex: EF-SUB-01, CLIM-EG-01)")
+                    num_c = st.text_input("Numéro du sous-compteur (ex: 1.CU.126, 1.GZ.117)")
                     
                     type_e = st.selectbox("Type d'énergie / Fluide", LISTE_TYPES_ENERGIE)
                     unite_c = st.selectbox("Unité de mesure", ["m3", "kWh", "MWh"])
@@ -928,7 +1123,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 st.error("🚨 Ce numéro de sous-compteur existe déjà dans la base.")
 
     # --------------------------------------------------------------------------
-    # 5. MODIFIER / REATTRIBUER / SUPPRIMER SOUS-COMPTEUR
+    # 6. MODIFIER SOUS-COMPTEUR
     # --------------------------------------------------------------------------
     with tab_edit_compteur:
         st.subheader("✏️ Modifier, Réattribuer ou Supprimer un Sous-Compteur")
@@ -999,7 +1194,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 6. RENOMMER LES SECTEURS
+    # 7. RENOMMER LES SECTEURS
     # --------------------------------------------------------------------------
     with tab_secteurs:
         st.subheader("🏷️ Personnaliser et renommer les secteurs")
@@ -1032,13 +1227,13 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     st.rerun()
 
     # --------------------------------------------------------------------------
-    # 7. LISTE GLOBALE DU PARC
+    # 8. LISTE GLOBALE DU PARC
     # --------------------------------------------------------------------------
     with tab_list:
         with engine.connect() as conn:
             df_all = pd.read_sql(text("""
                 SELECT c.ordre as "N° Ligne Excel", c.numero_compteur as "N° Compteur", s.nom as "Bâtiment", 
-                       s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
+                       s.ensemble_batiment as "Ensemble", s.secteur as "Secteur", s.surface_m2 as "Surface", s.epoque as "Époque RT",
                        c.type_energie as "Énergie", c.unite as "Unité"
                 FROM compteurs c
                 JOIN sites s ON s.id = c.site_id
@@ -1050,7 +1245,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         st.dataframe(df_all, hide_index=True, use_container_width=True)
 
     # --------------------------------------------------------------------------
-    # 8. HISTORIQUE DES MODIFICATIONS (AUDIT TRAIL)
+    # 9. HISTORIQUE DES MODIFICATIONS
     # --------------------------------------------------------------------------
     with tab_historique:
         st.subheader("🕓 Historique des corrections de relevés")
