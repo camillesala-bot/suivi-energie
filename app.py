@@ -537,8 +537,6 @@ elif menu == "🔥 Efficacité MWh/DJU":
         st.subheader("📊 Consommation par DJU, saison par saison")
         st.bar_chart(df_ratio["MWh/DJU"])
         st.dataframe(df_ratio.reset_index().rename(columns={"index": "Saison"}), hide_index=True, use_container_width=True)
-
-
 # ==============================================================================
 # TAB 4: SAISIE HEBDOMADAIRE (@st.fragment ISOLÉ AVEC S-1 À DROITE)
 # ==============================================================================
@@ -574,7 +572,7 @@ elif menu == "📝 Saisie Hebdomadaire":
 
         dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
         
-        # --- CORRECTION DE L'AFFICHAGE DU MESSAGE ---
+        # --- AFFICHAGE DU MESSAGE MÉTÉO ---
         if dju_result["message"]:
             if date_f >= today_date:
                 st.info(dju_result["message"])
@@ -588,30 +586,22 @@ elif menu == "📝 Saisie Hebdomadaire":
             c_ids = tuple(df_c['compteur_id'].tolist())
             dict_prev, dict_existants = get_releves_s1_et_actuels(c_ids, dt_d.strftime("%Y-%m-%d"), sem_label)
 
-            # Clé unique pour la session locale basée sur la semaine et la liste des compteurs
-            session_draft_key = f"draft_{sem_label}_{hash(c_ids)}"
+            # Clé unique stable pour maintenir l'état de la grille sans effacement
+            editor_key = f"grid_{sem_label}_{hash(c_ids)}"
 
             df_grid = df_c.copy()
             
-            # 1. Chargement des valeurs initiales BDD
+            # 1. Chargement des valeurs enregistrées en BDD
             df_grid['Consommation'] = df_grid['compteur_id'].map(lambda cid: float(dict_existants.get(cid, 0.0)))
             df_grid['Relevé S-1 (Précédent)'] = df_grid['compteur_id'].map(lambda cid: float(dict_prev.get(cid, 0.0)))
-            
-            # 2. Restauration du brouillon local s'il existe dans la session
-            if session_draft_key in st.session_state:
-                draft_data = st.session_state[session_draft_key]
-                if isinstance(draft_data, dict) and "edited_rows" in draft_data:
-                    for row_idx, changes in draft_data["edited_rows"].items():
-                        if "Consommation" in changes:
-                            df_grid.iloc[row_idx, df_grid.columns.get_loc("Consommation")] = float(changes["Consommation"])
 
-            # --- CALCUL DE L'ÉCART S-1 ---
+            # --- CALCUL INITIAL DE L'ÉCART S-1 ---
             df_grid['Écart S-1'] = df_grid.apply(
                 lambda r: r['Consommation'] - r['Relevé S-1 (Précédent)'] if r['Consommation'] > 0 and r['Relevé S-1 (Précédent)'] > 0 else 0.0,
                 axis=1
             )
 
-            # 3. Composant d'édition (Ordre Excel, Énergie et Unité masqués de l'affichage)
+            # 2. Éditeur de données Streamlit avec colonnes masquées
             edited_grid = st.data_editor(
                 df_grid,
                 column_order=[
@@ -631,7 +621,7 @@ elif menu == "📝 Saisie Hebdomadaire":
                     "Écart S-1": st.column_config.NumberColumn("Différence S - (S-1)", disabled=True, format="%.1f")
                 },
                 hide_index=True, use_container_width=True, num_rows="fixed",
-                key=session_draft_key
+                key=editor_key
             )
 
             # --- DÉTECTION ET ALERTE VISUELLE SI INDEX S < INDEX S-1 ---
@@ -704,10 +694,6 @@ elif menu == "📝 Saisie Hebdomadaire":
                         except Exception as e:
                             erreurs.append(f"Erreur lors de l'enregistrement par lot : {e}")
 
-                # Suppression du brouillon local après validation BDD
-                if session_draft_key in st.session_state:
-                    del st.session_state[session_draft_key]
-
                 get_releves_s1_et_actuels.clear()
                 get_compteurs_par_secteur.clear()
 
@@ -721,6 +707,8 @@ elif menu == "📝 Saisie Hebdomadaire":
             c_btn2.download_button(label="📥 Exporter cette semaine en Excel", data=generate_excel_bytes(df_export, sheet_name=f"Saisie_{sem_label.split(' ')[0]}"), file_name=f"saisie_compteurs_{sem_label.split(' ')[0]}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
         render_tableau_saisie(df_compteurs, selected_week_label, date_d, date_f, dju_val, dju_fiable_val)
+
+
 # ==============================================================================
 # TAB 5: GESTION ET ADMINISTRATION (VERROUILLÉ PAR CODE ADMIN)
 # ==============================================================================
