@@ -854,108 +854,103 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
 
         if uploaded_file is not None:
             try:
-                df_raw = pd.read_excel(uploaded_file, header=None)
+                # Lecture directe sans en-tête (fichier propre dès la ligne 0)
+                df_data = pd.read_excel(uploaded_file, header=None)
                 
-                start_row = None
-                for idx, row in df_raw.iterrows():
-                    if row.astype(str).str.contains("Nom du compteur", case=False).any():
-                        start_row = idx
-                        break
+                # Récupération des colonnes 0 (Code), 1 (Bâtiment) et 3 (Unité)
+                df_clean = pd.DataFrame({
+                    "code": df_data[0].astype(str).str.strip(),
+                    "batiment": df_data[1].astype(str).str.strip(),
+                    "unite": df_data[3].astype(str).str.strip()
+                }).dropna(subset=["code", "batiment"])
 
-                if start_row is None:
-                    st.error("🚨 Impossible de trouver l'en-tête 'Nom du compteur' dans le fichier Excel.")
-                else:
-                    df_data = pd.read_excel(uploaded_file, skiprows=start_row)
-                    df_data.columns = [str(c).strip() for c in df_data.columns]
+                # Filtrage des lignes vides éventuelles
+                df_clean = df_clean[(df_clean["code"] != "nan") & (df_clean["batiment"] != "nan")]
+
+                st.write(f"👀 **Aperçu des {len(df_clean)} sous-compteurs détectés pour `{secteur_cible}` :**")
+                st.dataframe(df_clean.head(10), use_container_width=True)
+
+                if st.button(f"🚀 Importer ces {len(df_clean)} compteurs dans {secteur_cible}", type="primary"):
+                    count_sites = 0
+                    count_compteurs = 0
                     
-                    col_code = df_data.columns[0]   # Code compteur (ex: 1.CU.126)
-                    col_bat = df_data.columns[1]    # Nom du bâtiment (ex: EAJE NEW YORK)
-                    col_unite = df_data.columns[2]  # Unité (MWh, m3, kWh)
+                    with engine.begin() as conn:
+                        for ordre_seq, (_, row) in enumerate(df_clean.iterrows(), start=1):
+                            code_brut = row["code"]
+                            bat_nom = row["batiment"]
+                            unite_excel = row["unite"] if row["unite"] != "nan" else ""
 
-                    df_clean = df_data.dropna(subset=[col_code, col_bat]).copy()
-                    df_clean = df_clean[~df_clean[col_code].astype(str).str.contains("Nom du compteur", case=False)]
+                            # Détection automatique du fluide via le code (ex: 2.CU.24 -> CU, 1.GZ.117 -> GZ)
+                            code_fluide = ""
+                            match = re.search(r"\.([A-Z]+)\.", code_brut)
+                            if match:
+                                code_fluide = match.group(1)
+                            
+                            type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
+                            unite_finale = unite_excel if unite_excel else unite_defaut
 
-                    st.write(f"👀 **Aperçu des {len(df_clean)} sous-compteurs détectés pour le `{secteur_cible}` :**")
-                    st.dataframe(df_clean[[col_code, col_bat, col_unite]].head(10), use_container_width=True)
+                            # A. Insertion ou récupération du bâtiment
+                            site_id = conn.execute(
+                                text("SELECT id FROM sites WHERE nom = :nom"),
+                                {"nom": bat_nom}
+                            ).scalar()
 
-                    if st.button(f"🚀 Importer ces compteurs dans {secteur_cible}", type="primary"):
-                        count_sites = 0
-                        count_compteurs = 0
-                        
-                        with engine.begin() as conn:
-                            for ordre_seq, (_, row) in enumerate(df_clean.iterrows(), start=1):
-                                code_brut = str(row[col_code]).strip()
-                                bat_nom = str(row[col_bat]).strip()
-                                unite_excel = str(row[col_unite]).strip() if pd.notna(row[col_unite]) else ""
-
-                                code_fluide = ""
-                                match = re.search(r"\.([A-Z]+)\.", code_brut)
-                                if match:
-                                    code_fluide = match.group(1)
-                                
-                                type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
-                                unite_finale = unite_excel if unite_excel else unite_defaut
-
+                            if not site_id:
                                 site_id = conn.execute(
-                                    text("SELECT id FROM sites WHERE nom = :nom"),
-                                    {"nom": bat_nom}
+                                    text("""
+                                        INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
+                                        VALUES (:nom, :sec, 1000.0, '2001-2012 (RT 2005)', 'Non regroupé')
+                                        RETURNING id
+                                    """),
+                                    {"nom": bat_nom, "sec": secteur_cible}
                                 ).scalar()
+                                count_sites += 1
+                            else:
+                                conn.execute(
+                                    text("UPDATE sites SET secteur = :sec WHERE id = :sid"),
+                                    {"sec": secteur_cible, "sid": site_id}
+                                )
 
-                                if not site_id:
-                                    site_id = conn.execute(
-                                        text("""
-                                            INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
-                                            VALUES (:nom, :sec, 1000.0, '2001-2012 (RT 2005)', 'Non regroupé')
-                                            RETURNING id
-                                        """),
-                                        {"nom": bat_nom, "sec": secteur_cible}
-                                    ).scalar()
-                                    count_sites += 1
-                                else:
-                                    conn.execute(
-                                        text("UPDATE sites SET secteur = :sec WHERE id = :sid"),
-                                        {"sec": secteur_cible, "sid": site_id}
-                                    )
+                            # B. Insertion ou Mise à jour du sous-compteur
+                            c_exists = conn.execute(
+                                text("SELECT COUNT(*) FROM compteurs WHERE numero_compteur = :num"),
+                                {"num": code_brut}
+                            ).scalar()
 
-                                c_exists = conn.execute(
-                                    text("SELECT COUNT(*) FROM compteurs WHERE numero_compteur = :num"),
-                                    {"num": code_brut}
-                                ).scalar()
+                            if c_exists == 0:
+                                conn.execute(
+                                    text("""
+                                        INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite, ordre)
+                                        VALUES (:sid, :num, :type_e, :unite, :ordre)
+                                    """),
+                                    {
+                                        "sid": site_id,
+                                        "num": code_brut,
+                                        "type_e": type_energie,
+                                        "unite": unite_finale,
+                                        "ordre": ordre_seq
+                                    }
+                                )
+                                count_compteurs += 1
+                            else:
+                                conn.execute(
+                                    text("""
+                                        UPDATE compteurs 
+                                        SET site_id = :sid, type_energie = :type_e, unite = :unite, ordre = :ordre
+                                        WHERE numero_compteur = :num
+                                    """),
+                                    {
+                                        "sid": site_id,
+                                        "type_e": type_energie,
+                                        "unite": unite_finale,
+                                        "ordre": ordre_seq,
+                                        "num": code_brut
+                                    }
+                                )
 
-                                if c_exists == 0:
-                                    conn.execute(
-                                        text("""
-                                            INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite, ordre)
-                                            VALUES (:sid, :num, :type_e, :unite, :ordre)
-                                        """),
-                                        {
-                                            "sid": site_id,
-                                            "num": code_brut,
-                                            "type_e": type_energie,
-                                            "unite": unite_finale,
-                                            "ordre": ordre_seq
-                                        }
-                                    )
-                                    count_compteurs += 1
-                                else:
-                                    conn.execute(
-                                        text("""
-                                            UPDATE compteurs 
-                                            SET site_id = :sid, type_energie = :type_e, unite = :unite, ordre = :ordre
-                                            WHERE numero_compteur = :num
-                                        """),
-                                        {
-                                            "sid": site_id,
-                                            "type_e": type_energie,
-                                            "unite": unite_finale,
-                                            "ordre": ordre_seq,
-                                            "num": code_brut
-                                        }
-                                    )
-
-                        st.cache_data.clear()
-                        set_flash(f"✅ Importation réussie pour {secteur_cible} ! {count_sites} bâtiment(s) créé(s) et {count_compteurs} sous-compteur(s) ordonnés.", "success")
-                        st.rerun()
+                    st.cache_data.clear()
+                    set_flash(f"✅ Importation réussie pour {secteur_cible} ! {count_sites} bâtiment(s) créé(s) et {count_compteurs} sous-compteur(s) rattachés.", "success")
+                    st.rerun()
 
             except Exception as e:
                 st.error(f"🚨 Erreur lors du traitement du fichier : {e}")
