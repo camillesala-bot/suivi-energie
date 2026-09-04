@@ -864,7 +864,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     "unite": df_data[3].astype(str).str.strip()
                 }).dropna(subset=["code", "batiment"])
 
-                # Filtrage des lignes vides éventuelles
+                # Filtrage des lignes vides
                 df_clean = df_clean[(df_clean["code"] != "nan") & (df_clean["batiment"] != "nan")]
 
                 st.write(f"👀 **Aperçu des {len(df_clean)} sous-compteurs détectés pour `{secteur_cible}` :**")
@@ -880,7 +880,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                             bat_nom = row["batiment"]
                             unite_excel = row["unite"] if row["unite"] != "nan" else ""
 
-                            # Détection automatique du fluide via le code (ex: 2.CU.24 -> CU, 1.GZ.117 -> GZ)
                             code_fluide = ""
                             match = re.search(r"\.([A-Z]+)\.", code_brut)
                             if match:
@@ -889,7 +888,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                             type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
                             unite_finale = unite_excel if unite_excel else unite_defaut
 
-                            # A. Insertion ou récupération du bâtiment
+                            # A. Insertion ou récupération du bâtiment (Gère les doublons de sites)
                             site_id = conn.execute(
                                 text("SELECT id FROM sites WHERE nom = :nom"),
                                 {"nom": bat_nom}
@@ -900,6 +899,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                     text("""
                                         INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
                                         VALUES (:nom, :sec, 1000.0, '2001-2012 (RT 2005)', 'Non regroupé')
+                                        ON CONFLICT (nom) DO UPDATE SET secteur = EXCLUDED.secteur
                                         RETURNING id
                                     """),
                                     {"nom": bat_nom, "sec": secteur_cible}
@@ -954,7 +954,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
 
             except Exception as e:
                 st.error(f"🚨 Erreur lors du traitement du fichier : {e}")
-
     # --------------------------------------------------------------------------
     # 2. ORDRE DES COMPTEURS (EXCEL)
     # --------------------------------------------------------------------------
