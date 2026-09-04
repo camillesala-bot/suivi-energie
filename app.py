@@ -17,10 +17,20 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- INJECTION CSS DESIGN ---
+# --- INJECTION CSS DESIGN & ANTI-FLOU ---
 st.markdown("""
 <style>
     .stApp { background-color: #f1f5f9; }
+    
+    /* SUPPRESSION DE L'EFFET FLOU / GRISÉ GLOBAL STREAMLIT */
+    .stApp [data-st-mode="running"],
+    [data-testid="stAppViewContainer"] [data-st-mode="running"],
+    div[data-testid="stForm"] {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+    }
+    
     .kpi-card {
         background-color: #ffffff;
         border-radius: 12px;
@@ -303,7 +313,7 @@ def convertir_en_mwh_equivalent(valeur: float, unite: str, type_energie: str = "
     elif unite in ['kwh', 'kw']: return float(valeur) / 1000.0
     return float(valeur)
 
-@st.cache_data(ttl=3600, show_spinner="☁️ Récupération de la météo réelle via Open-Meteo...")
+@st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_dju_hebdo_raw(date_debut_str: str, date_fin_str: str, lat: float, lon: float) -> dict:
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
@@ -631,7 +641,6 @@ elif menu == "📝 Saisie Hebdomadaire":
         selected_week_data = next(w for w in all_weeks if w["label"] == selected_week_label)
         date_d, date_f = selected_week_data["mon"], selected_week_data["sun"]
 
-        # --- OPTIMISATION DJU : IGNORER L'API SI SEMAINE EN COURS OU FUTURE ---
         if date_f >= today_date:
             dju_result = {
                 "dju": 100.0,
@@ -643,7 +652,6 @@ elif menu == "📝 Saisie Hebdomadaire":
 
         dju_val = col_dju.number_input("DJU Réels (Grenoble)", value=float(dju_result["dju"]))
         
-        # --- AFFICHAGE DU MESSAGE MÉTÉO ---
         if dju_result["message"]:
             if date_f >= today_date:
                 st.info(dju_result["message"])
@@ -661,17 +669,14 @@ elif menu == "📝 Saisie Hebdomadaire":
 
             df_grid = df_c.copy()
             
-            # 1. Chargement des valeurs enregistrées en BDD
             df_grid['Consommation'] = df_grid['compteur_id'].map(lambda cid: float(dict_existants.get(cid, 0.0)))
             df_grid['Relevé S-1 (Précédent)'] = df_grid['compteur_id'].map(lambda cid: float(dict_prev.get(cid, 0.0)))
 
-            # --- CALCUL INITIAL DE L'ÉCART S-1 ---
             df_grid['Écart S-1'] = df_grid.apply(
                 lambda r: r['Consommation'] - r['Relevé S-1 (Précédent)'] if r['Consommation'] > 0 and r['Relevé S-1 (Précédent)'] > 0 else 0.0,
                 axis=1
             )
 
-            # 2. Éditeur de données Streamlit (colonnes secondaires masquées)
             edited_grid = st.data_editor(
                 df_grid,
                 column_order=[
@@ -695,7 +700,6 @@ elif menu == "📝 Saisie Hebdomadaire":
                 key=editor_key
             )
 
-            # --- DÉTECTION ET ALERTE VISUELLE SI INDEX S < INDEX S-1 ---
             anomalies_incoherentes = edited_grid[
                 (edited_grid['Consommation'] > 0) & 
                 (edited_grid['Relevé S-1 (Précédent)'] > 0) & 
@@ -843,7 +847,7 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
     ])
     
     # --------------------------------------------------------------------------
-    # 1. IMPORTATION MASSIVE PAR SECTEUR / TOURNÉE
+    # 1. IMPORTATION MASSIVE PAR SECTEUR / TOURNÉE (OPTIMISÉE BATCH)
     # --------------------------------------------------------------------------
     with tab_import_secteur:
         st.subheader("📥 Importer une Fiche de Remplissage Excel par Secteur")
@@ -854,106 +858,88 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
 
         if uploaded_file is not None:
             try:
-                # Lecture directe sans en-tête (fichier propre dès la ligne 0)
                 df_data = pd.read_excel(uploaded_file, header=None)
                 
-                # Récupération des colonnes 0 (Code), 1 (Bâtiment) et 3 (Unité)
                 df_clean = pd.DataFrame({
                     "code": df_data[0].astype(str).str.strip(),
                     "batiment": df_data[1].astype(str).str.strip(),
                     "unite": df_data[3].astype(str).str.strip()
                 }).dropna(subset=["code", "batiment"])
 
-                # Filtrage des lignes vides
                 df_clean = df_clean[(df_clean["code"] != "nan") & (df_clean["batiment"] != "nan")]
 
                 st.write(f"👀 **Aperçu des {len(df_clean)} sous-compteurs détectés pour `{secteur_cible}` :**")
                 st.dataframe(df_clean.head(10), use_container_width=True)
 
                 if st.button(f"🚀 Importer ces {len(df_clean)} compteurs dans {secteur_cible}", type="primary"):
-                    count_sites = 0
-                    count_compteurs = 0
-                    
+                    sites_payload = []
+                    compteurs_payload = []
+
+                    for ordre_seq, (_, row) in enumerate(df_clean.iterrows(), start=1):
+                        code_brut = row["code"]
+                        bat_nom = row["batiment"]
+                        unite_excel = row["unite"] if row["unite"] != "nan" else ""
+
+                        code_fluide = ""
+                        match = re.search(r"\.([A-Z]+)\.", code_brut)
+                        if match:
+                            code_fluide = match.group(1)
+                        
+                        type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
+                        unite_finale = unite_excel if unite_excel else unite_defaut
+
+                        sites_payload.append({"nom": bat_nom, "sec": secteur_cible})
+                        compteurs_payload.append({
+                            "bat_nom": bat_nom,
+                            "num": code_brut,
+                            "type_e": type_energie,
+                            "unite": unite_finale,
+                            "ordre": ordre_seq
+                        })
+
                     with engine.begin() as conn:
-                        for ordre_seq, (_, row) in enumerate(df_clean.iterrows(), start=1):
-                            code_brut = row["code"]
-                            bat_nom = row["batiment"]
-                            unite_excel = row["unite"] if row["unite"] != "nan" else ""
+                        conn.execute(
+                            text("""
+                                INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
+                                VALUES (:nom, :sec, 1000.0, '2001-2012 (RT 2005)', 'Non regroupé')
+                                ON CONFLICT (nom) DO UPDATE SET secteur = EXCLUDED.secteur
+                            """),
+                            sites_payload
+                        )
 
-                            code_fluide = ""
-                            match = re.search(r"\.([A-Z]+)\.", code_brut)
-                            if match:
-                                code_fluide = match.group(1)
-                            
-                            type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
-                            unite_finale = unite_excel if unite_excel else unite_defaut
+                        sites_map = dict(conn.execute(text("SELECT nom, id FROM sites")).fetchall())
 
-                            # A. Insertion ou récupération du bâtiment (Gère les doublons de sites)
-                            site_id = conn.execute(
-                                text("SELECT id FROM sites WHERE nom = :nom"),
-                                {"nom": bat_nom}
-                            ).scalar()
+                        compteurs_final = [
+                            {
+                                "sid": sites_map[c["bat_nom"]],
+                                "num": c["num"],
+                                "type_e": c["type_e"],
+                                "unite": c["unite"],
+                                "ordre": c["ordre"]
+                            }
+                            for c in compteurs_payload
+                        ]
 
-                            if not site_id:
-                                site_id = conn.execute(
-                                    text("""
-                                        INSERT INTO sites (nom, secteur, surface_m2, epoque, ensemble_batiment)
-                                        VALUES (:nom, :sec, 1000.0, '2001-2012 (RT 2005)', 'Non regroupé')
-                                        ON CONFLICT (nom) DO UPDATE SET secteur = EXCLUDED.secteur
-                                        RETURNING id
-                                    """),
-                                    {"nom": bat_nom, "sec": secteur_cible}
-                                ).scalar()
-                                count_sites += 1
-                            else:
-                                conn.execute(
-                                    text("UPDATE sites SET secteur = :sec WHERE id = :sid"),
-                                    {"sec": secteur_cible, "sid": site_id}
-                                )
-
-                            # B. Insertion ou Mise à jour du sous-compteur
-                            c_exists = conn.execute(
-                                text("SELECT COUNT(*) FROM compteurs WHERE numero_compteur = :num"),
-                                {"num": code_brut}
-                            ).scalar()
-
-                            if c_exists == 0:
-                                conn.execute(
-                                    text("""
-                                        INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite, ordre)
-                                        VALUES (:sid, :num, :type_e, :unite, :ordre)
-                                    """),
-                                    {
-                                        "sid": site_id,
-                                        "num": code_brut,
-                                        "type_e": type_energie,
-                                        "unite": unite_finale,
-                                        "ordre": ordre_seq
-                                    }
-                                )
-                                count_compteurs += 1
-                            else:
-                                conn.execute(
-                                    text("""
-                                        UPDATE compteurs 
-                                        SET site_id = :sid, type_energie = :type_e, unite = :unite, ordre = :ordre
-                                        WHERE numero_compteur = :num
-                                    """),
-                                    {
-                                        "sid": site_id,
-                                        "type_e": type_energie,
-                                        "unite": unite_finale,
-                                        "ordre": ordre_seq,
-                                        "num": code_brut
-                                    }
-                                )
+                        conn.execute(
+                            text("""
+                                INSERT INTO compteurs (site_id, numero_compteur, type_energie, unite, ordre)
+                                VALUES (:sid, :num, :type_e, :unite, :ordre)
+                                ON CONFLICT (numero_compteur) DO UPDATE SET 
+                                    site_id = EXCLUDED.site_id,
+                                    type_energie = EXCLUDED.type_energie,
+                                    unite = EXCLUDED.unite,
+                                    ordre = EXCLUDED.ordre
+                            """),
+                            compteurs_final
+                        )
 
                     st.cache_data.clear()
-                    set_flash(f"✅ Importation réussie pour {secteur_cible} ! {count_sites} bâtiment(s) créé(s) et {count_compteurs} sous-compteur(s) rattachés.", "success")
+                    set_flash(f"✅ Importation réussie pour {secteur_cible} ! {len(compteurs_payload)} sous-compteur(s) traités instantanément.", "success")
                     st.rerun()
 
             except Exception as e:
                 st.error(f"🚨 Erreur lors du traitement du fichier : {e}")
+
     # --------------------------------------------------------------------------
     # 2. ORDRE DES COMPTEURS (EXCEL)
     # --------------------------------------------------------------------------
