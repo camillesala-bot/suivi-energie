@@ -817,6 +817,24 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
         st.session_state["admin_authenticated"] = False
         st.rerun()
 
+    # --- ZONE DE DANGER : REMISE À ZÉRO SÉCURISÉE DE LA BDD ---
+    with st.expander("🚨 Zone de Danger : Réinitialiser toute la base de données", expanded=False):
+        st.warning("⚠️ **Attention !** Cette action supprimera définitivement tous les bâtiments, sous-compteurs et relevés enregistrés.")
+        confirm_check = st.checkbox("Je confirme vouloir tout supprimer pour réimporter mes 7 secteurs.")
+        
+        if st.button("🔥 Tout supprimer (Remise à zéro complète)", type="primary", disabled=not confirm_check):
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM releves_audit;"))
+                conn.execute(text("DELETE FROM releves;"))
+                conn.execute(text("DELETE FROM compteurs;"))
+                conn.execute(text("DELETE FROM sites;"))
+            
+            st.cache_data.clear()
+            set_flash("La base de données a été entièrement réinitialisée avec succès !", "info")
+            st.rerun()
+
+    st.divider()
+
     # --- SOUS-ONGLETS D'ADMINISTRATION COMPLETS ---
     tab_import_secteur, tab_ordre_compteurs, tab_add_site, tab_edit_site, tab_add_compteur, tab_edit_compteur, tab_secteurs, tab_list, tab_historique = st.tabs([
         "📥 Importer par Secteur", "🔢 Ordre des Compteurs (Excel)", "➕ Ajouter Bâtiment", 
@@ -836,7 +854,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
 
         if uploaded_file is not None:
             try:
-                # Lecture brute sans en-tête pour repérer le début du tableau
                 df_raw = pd.read_excel(uploaded_file, header=None)
                 
                 start_row = None
@@ -855,7 +872,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                     col_bat = df_data.columns[1]    # Nom du bâtiment (ex: EAJE NEW YORK)
                     col_unite = df_data.columns[2]  # Unité (MWh, m3, kWh)
 
-                    # Nettoyage des lignes vides ou inutiles
                     df_clean = df_data.dropna(subset=[col_code, col_bat]).copy()
                     df_clean = df_clean[~df_clean[col_code].astype(str).str.contains("Nom du compteur", case=False)]
 
@@ -867,13 +883,11 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                         count_compteurs = 0
                         
                         with engine.begin() as conn:
-                            # Traitement séquentiel ligne par ligne
                             for ordre_seq, (_, row) in enumerate(df_clean.iterrows(), start=1):
                                 code_brut = str(row[col_code]).strip()
                                 bat_nom = str(row[col_bat]).strip()
                                 unite_excel = str(row[col_unite]).strip() if pd.notna(row[col_unite]) else ""
 
-                                # Détection du type d'énergie via le code (CU, GZ, EL, EF, EG)
                                 code_fluide = ""
                                 match = re.search(r"\.([A-Z]+)\.", code_brut)
                                 if match:
@@ -882,7 +896,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                 type_energie, unite_defaut = MAP_FLUIDES.get(code_fluide, ("Électricité", "kWh"))
                                 unite_finale = unite_excel if unite_excel else unite_defaut
 
-                                # A. Insertion ou récupération du Bâtiment
                                 site_id = conn.execute(
                                     text("SELECT id FROM sites WHERE nom = :nom"),
                                     {"nom": bat_nom}
@@ -904,7 +917,6 @@ elif menu == "⚙️ Gestion Sites, Compteurs & Secteurs":
                                         {"sec": secteur_cible, "sid": site_id}
                                     )
 
-                                # B. Insertion ou Mise à jour du Sous-Compteur
                                 c_exists = conn.execute(
                                     text("SELECT COUNT(*) FROM compteurs WHERE numero_compteur = :num"),
                                     {"num": code_brut}
